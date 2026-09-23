@@ -50,7 +50,7 @@ static void handler(int sig) {
 }
 
 static void usage() {
-    printf("Usage: wrk <options> <url>                            \n"
+    printf("Usage: wperfk <options> <url>                         \n"
            "  Options:                                            \n"
            "    -c, --connections <N>  Connections to keep open   \n"
            "    -d, --duration    <T>  Duration of test           \n"
@@ -526,20 +526,20 @@ static int response_complete(http_parser *parser) {
         printf("This wil never ever ever happen...");
         printf("But when it does. The following information will help in debugging");
         printf("response_complete:\n");
-        printf("  expected_latency_timing = %lld\n", expected_latency_timing);
-        printf("  now = %lld\n", now);
-        printf("  expected_latency_start = %lld\n", expected_latency_start);
-        printf("  c->thread_start = %lld\n", c->thread_start);
-        printf("  c->complete = %lld\n", c->complete);
+        printf("  expected_latency_timing = %lld\n", (long long) expected_latency_timing);
+        printf("  now = %lld\n", (long long) now);
+        printf("  expected_latency_start = %lld\n", (long long) expected_latency_start);
+        printf("  c->thread_start = %lld\n", (long long) c->thread_start);
+        printf("  c->complete = %lld\n", (long long) c->complete);
         printf("  throughput = %g\n", c->throughput);
-        printf("  latest_should_send_time = %lld\n", c->latest_should_send_time);
-        printf("  latest_expected_start = %lld\n", c->latest_expected_start);
-        printf("  latest_connect = %lld\n", c->latest_connect);
-        printf("  latest_write = %lld\n", c->latest_write);
+        printf("  latest_should_send_time = %lld\n", (long long) c->latest_should_send_time);
+        printf("  latest_expected_start = %lld\n", (long long) c->latest_expected_start);
+        printf("  latest_connect = %lld\n", (long long) c->latest_connect);
+        printf("  latest_write = %lld\n", (long long) c->latest_write);
 
         expected_latency_start = c->thread_start +
                 ((c->complete ) / c->throughput);
-        printf("  next expected_latency_start = %lld\n", expected_latency_start);
+        printf("  next expected_latency_start = %lld\n", (long long) expected_latency_start);
     }
 
     c->latest_should_send_time = 0;
@@ -753,8 +753,8 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
                 if (scan_metric(optarg, &cfg->rate)) return -1;
                 break;
             case 'v':
-                printf("wrk %s [%s] ", VERSION, aeGetApiName());
-                printf("Copyright (C) 2012 Will Glozer\n");
+                printf("wperfk %s [%s]\n", VERSION, aeGetApiName());
+                printf("Based on wrk2 (C) 2014 Gil Tene, Mike Barker and wrk (C) 2012 Will Glozer\n");
                 break;
             case 'h':
             case '?':
