@@ -7,6 +7,7 @@
 #include <sys/types.h>
 #include <netdb.h>
 #include <sys/socket.h>
+#include <unistd.h>
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -17,13 +18,21 @@
 #include "http_parser.h"
 #include "hdr_histogram.h"
 
+#ifndef VERSION
 #define VERSION  "0.1.0-dev"
+#endif
 #define RECVBUF  8192
 #define SAMPLES  100000000
 
 #define SOCKET_TIMEOUT_MS   2000
 #define CALIBRATE_DELAY_MS  10000
 #define TIMEOUT_INTERVAL_MS 2000
+#define RECORD_INTERVAL_MS  100
+
+/* long-only options */
+#define OPT_BODY      256
+#define OPT_BODY_FILE 257
+#define OPT_JSON      258
 
 typedef struct {
     pthread_t thread;
@@ -43,6 +52,7 @@ typedef struct {
     tinymt64_t rand;
     lua_State *L;
     errors errors;
+    uint64_t status_codes[600];
     struct connection *cs;
 } thread;
 

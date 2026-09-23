@@ -21,6 +21,10 @@ static struct config {
     bool     u_latency;
     bool     dynamic;
     bool     record_all_responses;
+    bool     json;
+    char    *method;
+    char    *body;
+    size_t   body_len;
     char    *host;
     char    *script;
     SSL_CTX *ctx;
@@ -65,10 +69,13 @@ static void usage() {
            "                           batches of pipelined ops   \n"
            "                           (as opposed to each op)    \n"
            "    -v, --version          Print version details      \n"
-           "    -R, --rate        <T>  work rate (throughput)     \n"
-           "                           in requests/sec (total)    \n"
-           "                           [Required Parameter]       \n"
-           "                                                      \n"
+           "    -R, --rate        <T>  constant rate in requests/sec (total).   \n"
+           "                           Omit for closed-loop max throughput.     \n"
+           "    -m, --method      <M>  HTTP method (default GET)                \n"
+           "        --body        <S>  Request body                             \n"
+           "        --body-file   <F>  Request body from file                   \n"
+           "        --json             Print JSON summary on stdout; all other   \n"
+           "                           output (incl. Lua print) goes to stderr  \n"
            "                                                      \n"
            "  Numeric arguments may include a SI unit (1k, 1M, 1G)\n"
            "  Time arguments may include a time unit (2s, 2m, 2h)\n");
@@ -82,6 +89,15 @@ int main(int argc, char **argv) {
         usage();
         exit(1);
     }
+
+    FILE *json_out = NULL;
+    if (cfg.json) {
+        fflush(stdout);
+        json_out = fdopen(dup(STDOUT_FILENO), "w");
+        dup2(STDERR_FILENO, STDOUT_FILENO);
+    }
+
+    script_request_defaults(cfg.method, cfg.body, cfg.body_len);
 
     char *schema  = copy_url_part(url, &parts, UF_SCHEMA);
     char *host    = copy_url_part(url, &parts, UF_HOST);
@@ -162,11 +178,17 @@ int main(int argc, char **argv) {
     printf("Running %s test @ %s\n", time, url);
     printf("  %"PRIu64" threads and %"PRIu64" connections\n",
             cfg.threads, cfg.connections);
+    if (cfg.rate) {
+        printf("  Mode: constant rate %"PRIu64" req/s (latency corrected for coordinated omission)\n", cfg.rate);
+    } else {
+        printf("  Mode: closed loop, max throughput (latency NOT corrected for coordinated omission)\n");
+    }
 
     uint64_t start    = time_us();
     uint64_t complete = 0;
     uint64_t bytes    = 0;
     errors errors     = { 0 };
+    uint64_t *status_codes = zcalloc(600 * sizeof(uint64_t));
 
     struct hdr_histogram* latency_histogram;
     hdr_init(1, MAX_LATENCY, 3, &latency_histogram);
@@ -190,6 +212,7 @@ int main(int argc, char **argv) {
         errors.write   += t->errors.write;
         errors.timeout += t->errors.timeout;
         errors.status  += t->errors.status;
+        for (int s = 0; s < 600; s++) status_codes[s] += t->status_codes[s];
 
         hdr_add(latency_histogram, t->latency_histogram);
         hdr_add(u_latency_histogram, t->u_latency_histogram);
@@ -198,6 +221,10 @@ int main(int argc, char **argv) {
     long double runtime_s   = runtime_us / 1000000.0;
     long double req_per_s   = complete   / runtime_s;
     long double bytes_per_s = bytes      / runtime_s;
+
+    if (statistics.requests->histogram->total_count == 0) {
+        stats_record(statistics.requests, (uint64_t) req_per_s);
+    }
 
     stats *latency_stats = stats_alloc(10);
     latency_stats->min = hdr_min(latency_histogram);
@@ -244,6 +271,12 @@ int main(int argc, char **argv) {
         script_done(L, latency_stats, statistics.requests);
     }
 
+    if (json_out) {
+        print_json(json_out, url, runtime_us, complete, bytes, &errors,
+                   latency_histogram, u_latency_histogram, status_codes);
+        fclose(json_out);
+    }
+
     return 0;
 }
 
@@ -276,14 +309,20 @@ void *thread_main(void *arg) {
         c->catch_up_throughput = throughput * 2;
         c->complete   = 0;
         c->caught_up  = true;
-        // Stagger connects 5 msec apart within thread:
-        aeCreateTimeEvent(loop, i * 5, delayed_initial_connect, c, NULL);
+        // Rate mode: stagger connects 5 msec apart within thread.
+        // Closed loop: connect all at once, like wrk.
+        aeCreateTimeEvent(loop, cfg.rate ? i * 5 : 0, delayed_initial_connect, c, NULL);
     }
 
-    uint64_t calibrate_delay = CALIBRATE_DELAY_MS + (thread->connections * 5);
-    uint64_t timeout_delay = TIMEOUT_INTERVAL_MS + (thread->connections * 5);
+    uint64_t stagger = cfg.rate ? thread->connections * 5 : 0;
+    uint64_t timeout_delay = TIMEOUT_INTERVAL_MS + stagger;
 
-    aeCreateTimeEvent(loop, calibrate_delay, calibrate, thread, NULL);
+    if (cfg.rate) {
+        aeCreateTimeEvent(loop, CALIBRATE_DELAY_MS + stagger, calibrate, thread, NULL);
+    } else {
+        thread->interval = RECORD_INTERVAL_MS;
+        aeCreateTimeEvent(loop, thread->interval, sample_rate, thread, NULL);
+    }
     aeCreateTimeEvent(loop, timeout_delay, check_timeouts, thread, NULL);
 
     thread->start = time_us();
@@ -433,6 +472,8 @@ static int response_body(http_parser *parser, const char *at, size_t len) {
 static uint64_t usec_to_next_send(connection *c) {
     uint64_t now = time_us();
 
+    if (!cfg.rate) return 0; // closed loop: send as soon as possible
+
     uint64_t next_start_time = c->thread_start + (c->complete / c->throughput);
 
     bool send_now = true;
@@ -493,6 +534,9 @@ static int response_complete(http_parser *parser) {
     if (status > 399) {
         thread->errors.status++;
     }
+    if (status > 0 && status < 600) {
+        thread->status_codes[status]++;
+    }
 
     if (c->headers.buffer) {
         *c->headers.cursor++ = '\0';
@@ -515,8 +559,9 @@ static int response_complete(http_parser *parser) {
     // start time based on the completion count of these individual pipelined
     // requests we can easily end up "gifting" them time and seeing
     // negative latencies.
-    uint64_t expected_latency_start = c->thread_start +
-            (c->complete_at_last_batch_start / c->throughput);
+    uint64_t expected_latency_start = cfg.rate
+            ? c->thread_start + (c->complete_at_last_batch_start / c->throughput)
+            : c->actual_latency_start;
 
     int64_t expected_latency_timing = now - expected_latency_start;
 
@@ -704,11 +749,16 @@ static struct option longopts[] = {
     { "help",           no_argument,       NULL, 'h' },
     { "version",        no_argument,       NULL, 'v' },
     { "rate",           required_argument, NULL, 'R' },
+    { "method",         required_argument, NULL, 'm' },
+    { "body",           required_argument, NULL, OPT_BODY },
+    { "body-file",      required_argument, NULL, OPT_BODY_FILE },
+    { "json",           no_argument,       NULL, OPT_JSON },
     { NULL,             0,                 NULL,  0  }
 };
 
 static int parse_args(struct config *cfg, char **url, struct http_parser_url *parts, char **headers, int argc, char **argv) {
-    char c, **header = headers;
+    int c;
+    char **header = headers;
 
     memset(cfg, 0, sizeof(struct config));
     cfg->threads     = 2;
@@ -718,7 +768,7 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
     cfg->rate        = 0;
     cfg->record_all_responses = true;
 
-    while ((c = getopt_long(argc, argv, "t:c:d:s:H:T:R:LUBrv?", longopts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "t:c:d:s:H:T:R:m:LUBrv?", longopts, NULL)) != -1) {
         switch (c) {
             case 't':
                 if (scan_metric(optarg, &cfg->threads)) return -1;
@@ -752,6 +802,22 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
             case 'R':
                 if (scan_metric(optarg, &cfg->rate)) return -1;
                 break;
+            case 'm':
+                cfg->method = optarg;
+                break;
+            case OPT_BODY:
+                cfg->body     = optarg;
+                cfg->body_len = strlen(optarg);
+                break;
+            case OPT_BODY_FILE:
+                if (read_file(optarg, &cfg->body, &cfg->body_len)) {
+                    fprintf(stderr, "unable to read body file %s: %s\n", optarg, strerror(errno));
+                    return -1;
+                }
+                break;
+            case OPT_JSON:
+                cfg->json = true;
+                break;
             case 'v':
                 printf("wperfk %s [%s]\n", VERSION, aeGetApiName());
                 printf("Based on wrk2 (C) 2014 Gil Tene, Mike Barker and wrk (C) 2012 Will Glozer\n");
@@ -773,12 +839,6 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
 
     if (!cfg->connections || cfg->connections < cfg->threads) {
         fprintf(stderr, "number of connections must be >= threads\n");
-        return -1;
-    }
-
-    if (cfg->rate == 0) {
-        fprintf(stderr,
-                "Throughput MUST be specified with the --rate or -R option\n");
         return -1;
     }
 
@@ -841,4 +901,77 @@ static void print_stats_latency(stats *stats) {
         print_units(n, format_time_us, 10);
         printf("\n");
     }
+}
+
+static int read_file(const char *path, char **data, size_t *len) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    size_t cap = 4096, n = 0, r;
+    char *buf = zmalloc(cap);
+    while ((r = fread(buf + n, 1, cap - n, f)) > 0) {
+        n += r;
+        if (n == cap) buf = zrealloc(buf, cap *= 2);
+    }
+    int err = ferror(f);
+    fclose(f);
+    if (err) { zfree(buf); return -1; }
+    *data = buf;
+    *len  = n;
+    return 0;
+}
+
+static void json_string(FILE *out, const char *s) {
+    fputc('"', out);
+    for (; *s; s++) {
+        unsigned char ch = (unsigned char) *s;
+        if (ch == '"' || ch == '\\') fprintf(out, "\\%c", ch);
+        else if (ch < 0x20)          fprintf(out, "\\u%04x", ch);
+        else                         fputc(ch, out);
+    }
+    fputc('"', out);
+}
+
+static void json_latency(FILE *out, const char *name, struct hdr_histogram *h) {
+    static const double pct[]   = { 50, 75, 90, 99, 99.9, 99.99, 99.999 };
+    static const char  *label[] = { "p50", "p75", "p90", "p99", "p99_9", "p99_99", "p99_999" };
+    fprintf(out, "\"%s\":{\"min\":%"PRId64",\"max\":%"PRId64",\"mean\":%.2f,\"stdev\":%.2f",
+            name, h->total_count ? hdr_min(h) : 0, hdr_max(h),
+            h->total_count ? hdr_mean(h) : 0.0, h->total_count ? hdr_stddev(h) : 0.0);
+    for (size_t i = 0; i < sizeof(pct) / sizeof(pct[0]); i++) {
+        fprintf(out, ",\"%s\":%"PRId64, label[i], hdr_value_at_percentile(h, pct[i]));
+    }
+    fputc('}', out);
+}
+
+static void print_json(FILE *out, char *url, uint64_t runtime_us, uint64_t complete,
+                       uint64_t bytes, errors *e, struct hdr_histogram *latency,
+                       struct hdr_histogram *u_latency, uint64_t *status_codes) {
+    double runtime_s = runtime_us / 1000000.0;
+    uint64_t total_errors = (uint64_t) e->connect + e->read + e->write + e->timeout + e->status;
+
+    fprintf(out, "{\"tool\":\"wperfk\",\"version\":");
+    json_string(out, VERSION);
+    fprintf(out, ",\"url\":");
+    json_string(out, url);
+    fprintf(out, ",\"mode\":\"%s\",\"rate\":%"PRIu64
+                 ",\"threads\":%"PRIu64",\"connections\":%"PRIu64",\"duration_s\":%"PRIu64,
+            cfg.rate ? "rate" : "closed", cfg.rate, cfg.threads, cfg.connections, cfg.duration);
+    fprintf(out, ",\"runtime_us\":%"PRIu64",\"requests\":%"PRIu64",\"bytes\":%"PRIu64
+                 ",\"requests_per_sec\":%.2f,\"bytes_per_sec\":%.2f",
+            runtime_us, complete, bytes,
+            runtime_s > 0 ? complete / runtime_s : 0.0, runtime_s > 0 ? bytes / runtime_s : 0.0);
+    fprintf(out, ",\"errors\":{\"total\":%"PRIu64",\"connect\":%u,\"read\":%u,\"write\":%u"
+                 ",\"timeout\":%u,\"status\":%u}",
+            total_errors, e->connect, e->read, e->write, e->timeout, e->status);
+    fprintf(out, ",\"status_codes\":{");
+    for (int s = 0, first = 1; s < 600; s++) {
+        if (!status_codes[s]) continue;
+        fprintf(out, "%s\"%d\":%"PRIu64, first ? "" : ",", s, status_codes[s]);
+        first = 0;
+    }
+    fprintf(out, "},\"latency_unit\":\"us\",");
+    json_latency(out, "latency", latency);
+    fputc(',', out);
+    json_latency(out, "latency_uncorrected", u_latency);
+    fprintf(out, "}\n");
 }

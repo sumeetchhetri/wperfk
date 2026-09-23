@@ -8,6 +8,21 @@
 #include "stats.h"
 #include "zmalloc.h"
 
+extern const unsigned char luaJIT_BC_wrk[];
+extern const unsigned long luaJIT_BC_wrk_size;
+
+static struct {
+    const char *method;
+    const char *body;
+    size_t      body_len;
+} request_defaults;
+
+void script_request_defaults(const char *method, const char *body, size_t body_len) {
+    request_defaults.method   = method;
+    request_defaults.body     = body;
+    request_defaults.body_len = body_len;
+}
+
 typedef struct {
     char *name;
     int   type;
@@ -49,6 +64,18 @@ static const luaL_Reg threadlib[] = {
 lua_State *script_create(char *file, char *url, char **headers) {
     lua_State *L = luaL_newstate();
     luaL_openlibs(L);
+
+    // Preload the embedded wrk module directly instead of relying on
+    // LuaJIT's dlsym() lookup, which fails in static binaries.
+    lua_getglobal(L, "package");
+    lua_getfield(L, -1, "preload");
+    if (luaL_loadbuffer(L, (const char *) luaJIT_BC_wrk, luaJIT_BC_wrk_size, "=wrk") == 0) {
+        lua_setfield(L, -2, "wrk");
+    } else {
+        fprintf(stderr, "wrk module: %s\n", lua_tostring(L, -1));
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 2);
     (void) luaL_dostring(L, "wrk = require \"wrk\"");
 
     luaL_newmetatable(L, "wrk.addr");
@@ -90,7 +117,18 @@ lua_State *script_create(char *file, char *url, char **headers) {
             lua_settable(L, 5);
         }
     }
-    lua_pop(L, 5);
+    lua_pop(L, 1);
+
+    // CLI defaults; a script may still override them.
+    if (request_defaults.method) {
+        lua_pushstring(L, request_defaults.method);
+        lua_setfield(L, 4, "method");
+    }
+    if (request_defaults.body) {
+        lua_pushlstring(L, request_defaults.body, request_defaults.body_len);
+        lua_setfield(L, 4, "body");
+    }
+    lua_pop(L, 4);
 
     if (file && luaL_dofile(L, file)) {
         const char *cause = lua_tostring(L, -1);

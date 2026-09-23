@@ -47,11 +47,14 @@ static int response_body(http_parser *, const char *, size_t);
 
 static uint64_t time_us();
 
+static int read_file(const char *, char **, size_t *);
 static int parse_args(struct config *, char **, struct http_parser_url *, char **, int, char **);
 static char *copy_url_part(char *, struct http_parser_url *, enum http_parser_url_fields);
 static void print_stats_header();
 static void print_stats(char *, stats *, char *(*)(long double));
 static void print_stats_latency(stats *);
 static void print_hdr_latency(struct hdr_histogram*, const char*);
+static void print_json(FILE *, char *, uint64_t, uint64_t, uint64_t, errors *,
+                       struct hdr_histogram *, struct hdr_histogram *, uint64_t *);
 
 #endif /* MAIN_H */

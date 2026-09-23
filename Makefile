@@ -1,5 +1,8 @@
 CFLAGS  += -std=c99 -Wall -O2 -D_REENTRANT
-LIBS    := -lm -lssl -lcrypto -lpthread
+ifneq ($(VERSION),)
+	CFLAGS += -DVERSION='"$(VERSION)"'
+endif
+LIBS     = -lm $(SSL_LIBS) -lpthread
 
 TARGET  := $(shell uname -s | tr '[A-Z]' '[a-z]' 2>/dev/null || echo unknown)
 
@@ -17,6 +20,17 @@ else ifeq ($(TARGET), linux)
 else ifeq ($(TARGET), freebsd)
 	CFLAGS  += -D_DECLARE_C99_LDBL_MATH
 	LDFLAGS += -Wl,-E
+endif
+
+# STATIC=1: fully static on Linux (use musl, e.g. Alpine); on macOS link
+# OpenSSL statically (libSystem is always dynamic there).
+SSL_LIBS := -lssl -lcrypto
+ifeq ($(STATIC),1)
+	ifeq ($(TARGET), darwin)
+		SSL_LIBS := $(WITH_OPENSSL)/lib/libssl.a $(WITH_OPENSSL)/lib/libcrypto.a
+	else
+		LDFLAGS  += -static
+	endif
 endif
 
 SRC  := wrk.c net.c ssl.c aprintf.c stats.c script.c units.c \
@@ -65,6 +79,7 @@ $(ODIR):
 $(ODIR)/bytecode.c: src/wrk.lua $(LUAJIT_DEP) | $(ODIR)
 	@echo LUAJIT $<
 	@$(SHELL) -c '$(LUAJIT_BC)'
+	@printf 'const unsigned long luaJIT_BC_wrk_size = sizeof(luaJIT_BC_wrk);\n' >> $@
 
 $(ODIR)/bytecode.o: $(ODIR)/bytecode.c
 	@echo CC $<
