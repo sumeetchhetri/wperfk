@@ -1,0 +1,89 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build:
+    name: ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: linux,  arch: amd64, runner: ubuntu-24.04 }
+          - { os: linux,  arch: arm64, runner: ubuntu-24.04-arm }
+          - { os: darwin, arch: amd64, runner: macos-15-intel }
+          - { os: darwin, arch: arm64, runner: macos-15 }
+          # windows amd64/arm64 are added in P2 (tools/package.sh already emits .zip)
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+
+      - name: Version from tag
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Build (Linux, static musl)
+        if: matrix.os == 'linux'
+        run: |
+          docker run --rm -e VERSION -v "$PWD:/src" -w /src alpine:3.22 sh -ec '
+            apk add --no-cache build-base perl linux-headers git openssl-dev openssl-libs-static
+            git config --global --add safe.directory "*"
+            make -j4 STATIC=1 VERSION="$VERSION"'
+          file wperfk
+
+      - name: Build (macOS, static OpenSSL)
+        if: matrix.os == 'darwin'
+        run: |
+          brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+          make -j4 STATIC=1 VERSION="$VERSION"
+          otool -L wperfk
+          if otool -L wperfk | grep -q -e homebrew -e /usr/local/opt; then
+            echo "::error::binary links against Homebrew libraries"; exit 1
+          fi
+
+      - name: Smoke test
+        run: tests/smoke.sh ./wperfk
+
+      - name: Package
+        run: tools/package.sh "$VERSION" "${{ matrix.os }}" "${{ matrix.arch }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wperfk-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          cd dist && sha256sum wperfk_* > "wperfk_${VERSION}_checksums.txt"
+          cat "wperfk_${VERSION}_checksums.txt"
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/wperfk_*
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pre=""; case "$GITHUB_REF_NAME" in *-*) pre="--prerelease";; esac
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" --generate-notes $pre

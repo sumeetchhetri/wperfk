@@ -13,7 +13,7 @@ wperfk brings together the best of the four tools most engineers reach for:
 
 Existing wrk/wrk2 Lua scripts run unmodified.
 
-> **Status: pre-alpha.** P0 is done: LuaJIT 2.1, Apple Silicon build fixes, OpenSSL 3, and CI on Linux x64/arm64 and macOS arm64. See the [roadmap](#roadmap).
+> **Status: pre-alpha.** P0 is done, and the integration contract used by [GATF](https://github.com/sumeetchhetri/gatf) is in place: wrk-compatible CLI, optional `-R`, `--json`, and request options without Lua. See the [roadmap](#roadmap).
 
 ## Why this exists
 
@@ -113,6 +113,47 @@ This is our reading of the licences, not legal advice. If any upstream author se
 | Lua | LuaJIT 2.1 (pinned submodule) | same |
 | TLS | OpenSSL 3.x | same, static |
 
+## Usage
+
+```
+wperfk -t4 -c100 -d30s --latency https://host/path            # closed loop (wrk)
+wperfk -t4 -c100 -d30s -R 2000 --latency https://host/path    # constant rate (wrk2)
+wperfk -t2 -c10 -d10s -m POST --body-file req.json \
+       -H "Content-Type: application/json" --json https://host/api
+```
+
+| Option | Meaning |
+|---|---|
+| `-t -c -d -s -H -L/--latency -U -B --timeout` | Same as wrk / wrk2 |
+| `-R, --rate <N>` | Constant rate in req/s. Omit for closed-loop max throughput |
+| `-m, --method <M>` | HTTP method |
+| `--body <S>`, `--body-file <F>` | Request body (binary-safe from file) |
+| `--json` | JSON summary on stdout. All other output, including Lua `print`, goes to stderr |
+
+CLI `-m/--body/-H` set defaults. A `-s` script can still override them.
+
+**`--json` output** (one object, latencies in µs):
+
+```json
+{"tool":"wperfk","version":"0.1.0","url":"http://…","mode":"rate","rate":100,
+ "threads":2,"connections":4,"duration_s":2,"runtime_us":2001234,
+ "requests":202,"bytes":34436,"requests_per_sec":100.94,"bytes_per_sec":17207.8,
+ "errors":{"total":0,"connect":0,"read":0,"write":0,"timeout":0,"status":0},
+ "status_codes":{"200":202},"latency_unit":"us",
+ "latency":{"min":…,"max":…,"mean":…,"stdev":…,"p50":…,"p75":…,"p90":…,"p99":…,"p99_9":…,"p99_99":…,"p99_999":…},
+ "latency_uncorrected":{…}}
+```
+
+`mode` is `closed` or `rate`. In `closed` mode, `latency` and `latency_uncorrected` are identical. `errors.status` counts responses ≥ 400.
+
+## Release assets
+
+Each `v*` tag publishes:
+
+- `wperfk_<version>_<os>_<arch>.tar.gz`, or `.zip` for Windows. `os` is `linux`, `darwin` or `windows`; `arch` is `amd64` or `arm64`. The binary, LICENSE, NOTICE and README sit at the archive root. Linux builds are fully static (musl); macOS builds link OpenSSL statically.
+- `wperfk_<version>_checksums.txt`, one `sha256  filename` line per archive (`sha256sum` format).
+- GitHub build-provenance attestations for every archive.
+
 ## Building from source
 
 ```sh
@@ -122,6 +163,7 @@ make                      # Linux: needs libssl-dev
 make                      # macOS: needs `brew install openssl@3` (auto-detected)
 make WITH_LUAJIT=/prefix  # optional: use an installed LuaJIT 2.1
 make WITH_OPENSSL=/prefix # optional: use a specific OpenSSL
+make STATIC=1 VERSION=x.y # release-style build (use Alpine/musl on Linux)
 tests/smoke.sh ./wperfk   # HTTP, HTTPS and every script in scripts/
 ```
 
@@ -132,11 +174,12 @@ Windows builds arrive in P2.
 | Phase | Scope | Status |
 |---|---|---|
 | P0 | Bootstrap from wrk2; LuaJIT 2.1; Apple Silicon and OpenSSL 3 fixes; CI (Linux x64/arm64, macOS arm64) with smoke tests | ✅ done |
-| P1 | Optional `-R` (closed loop without it), HdrHistogram in both models, `delay()`, `stats(p)`, monotonic clock, `-p`, `-n`, `--warmup`, `--bailout`, `--status-codes`, rate units, fix `-nan` Req/Sec on short runs | next |
+| P1a | Optional `-R` (closed loop without it), `-m`, `--body`, `--body-file`, `--json` with status-code breakdown, static-safe embedded Lua module, release workflow and asset naming | ✅ done |
+| P1b | `delay()`, `stats(p)`, monotonic clock, `-p`, `-n`, `--warmup`, `--bailout`, rate units | next |
 | P2 | Windows x64: wepoll backend, Winsock shims, Ctrl+C handling | |
 | P3 | Release matrix: static musl Linux, macOS universal, Windows x64/arm64, FreeBSD; checksums + build attestations | |
 | P4 | Homebrew tap, Scoop bucket, winget | |
-| P5 | `--json`, `--progress`, `--targets`, `--hist-out` + `merge`, `--expect-*`, mTLS/SNI/verify, `--resolve` | |
+| P5 | `--progress`, `--targets`, `--hist-out` + `merge`, `--expect-*`, mTLS/SNI/verify, `--resolve` | |
 | P6 | Unix sockets / named pipes, HAR converter, Prometheus exporter, llhttp to replace archived `http_parser` | |
 
 ## Known limitations

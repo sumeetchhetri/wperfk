@@ -43,3 +43,21 @@ jobs:
         with:
           name: wperfk-${{ matrix.name }}
           path: wperfk
+
+  linux-musl-static:
+    name: linux-x86_64-musl-static
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+      - name: Build (same recipe as release)
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src alpine:3.22 sh -ec '
+            apk add --no-cache build-base perl linux-headers git openssl-dev openssl-libs-static
+            git config --global --add safe.directory "*"
+            make -j4 STATIC=1'
+          file wperfk
+      - name: Smoke test
+        run: tests/smoke.sh ./wperfk
