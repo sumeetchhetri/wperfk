@@ -820,7 +820,7 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
                 break;
             case 'v':
                 printf("wperfk %s [%s]\n", VERSION, aeGetApiName());
-                printf("Based on wrk2 (C) 2014 Gil Tene, Mike Barker and wrk (C) 2012 Will Glozer\n");
+                printf("Based on wrk2 (C) 2014 Gil Tene, Mike Barker and wrk (C) 2012 Will Glozer and Extended/Updated by Sumeet Chhetri 2026\n");
                 break;
             case 'h':
             case '?':
