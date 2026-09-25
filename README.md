@@ -13,7 +13,7 @@ wperfk brings together the best of the four tools most engineers reach for:
 
 Existing wrk/wrk2 Lua scripts run unmodified.
 
-> **Status: pre-alpha.** P0 is done, and the integration contract used by [GATF](https://github.com/sumeetchhetri/gatf) is in place: wrk-compatible CLI, optional `-R`, `--json`, and request options without Lua. See the [roadmap](#roadmap).
+> **Status: pre-alpha.** P0 and P1 are done: wrk and wrk2 modes in one binary, the combined Lua API, autocannon/vegeta-style flags, and `--json` for [GATF](https://github.com/sumeetchhetri/gatf). Windows (P2) is next. See the [roadmap](#roadmap).
 
 ## Why this exists
 
@@ -125,7 +125,11 @@ wperfk -t2 -c10 -d10s -m POST --body-file req.json \
 | Option | Meaning |
 |---|---|
 | `-t -c -d -s -H -L/--latency -U -B --timeout` | Same as wrk / wrk2 |
-| `-R, --rate <N>` | Constant rate in req/s. Omit for closed-loop max throughput |
+| `-R, --rate <N>` | Constant rate: `2000`, `50/1s`, `3000/1m`, `5/100ms` (≥ 1 req/s). Omit for closed-loop max throughput |
+| `-p, --pipeline <N>` | Pipeline N requests per connection (no Lua needed) |
+| `-n, --requests <N>` | Stop after exactly N responses. Without `-d`, there is no time limit |
+| `--warmup <T>` | Send traffic for T first, and exclude it from every result |
+| `--bailout <N>` | Stop after N errors, with exit code 2 |
 | `-m, --method <M>` | HTTP method |
 | `--body <S>`, `--body-file <F>` | Request body (binary-safe from file) |
 | `--json` | JSON summary on stdout. All other output, including Lua `print`, goes to stderr |
@@ -137,6 +141,7 @@ CLI `-m/--body/-H` set defaults. A `-s` script can still override them.
 ```json
 {"tool":"wperfk","version":"0.1.0","url":"http://…","mode":"rate","rate":100,
  "threads":2,"connections":4,"duration_s":2,"runtime_us":2001234,
+ "pipeline":1,"warmup_s":0,"requests_limit":0,"bailout":0,"stopped_by":"duration",
  "requests":202,"bytes":34436,"requests_per_sec":100.94,"bytes_per_sec":17207.8,
  "errors":{"total":0,"connect":0,"read":0,"write":0,"timeout":0,"status":0},
  "status_codes":{"200":202},"latency_unit":"us",
@@ -144,7 +149,7 @@ CLI `-m/--body/-H` set defaults. A `-s` script can still override them.
  "latency_uncorrected":{…}}
 ```
 
-`mode` is `closed` or `rate`. In `closed` mode, `latency` and `latency_uncorrected` are identical. `errors.status` counts responses ≥ 400.
+`stopped_by` is `duration`, `requests`, `bailout` or `signal`. `mode` is `closed` or `rate`. In `closed` mode, `latency` and `latency_uncorrected` are identical. `errors.status` counts responses ≥ 400.
 
 ## Release assets
 
@@ -175,8 +180,8 @@ Windows builds arrive in P2.
 |---|---|---|
 | P0 | Bootstrap from wrk2; LuaJIT 2.1; Apple Silicon and OpenSSL 3 fixes; CI (Linux x64/arm64, macOS arm64) with smoke tests | ✅ done |
 | P1a | Optional `-R` (closed loop without it), `-m`, `--body`, `--body-file`, `--json` with status-code breakdown, static-safe embedded Lua module, release workflow and asset naming | ✅ done |
-| P1b | `delay()`, `stats(p)`, monotonic clock, `-p`, `-n`, `--warmup`, `--bailout`, rate units | next |
-| P2 | Windows x64: wepoll backend, Winsock shims, Ctrl+C handling | |
+| P1b | `delay()`, `stats(p)`, monotonic clock, `-p`, `-n`, `--warmup`, `--bailout`, rate units, 100 ms stop latency | ✅ done |
+| P2 | Windows x64: wepoll backend, Winsock shims, Ctrl+C handling | next |
 | P3 | Release matrix: static musl Linux, macOS universal, Windows x64/arm64, FreeBSD; checksums + build attestations | |
 | P4 | Homebrew tap, Scoop bucket, winget | |
 | P5 | `--progress`, `--targets`, `--hist-out` + `merge`, `--expect-*`, mTLS/SNI/verify, `--resolve` | |

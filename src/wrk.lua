@@ -42,6 +42,9 @@ function wrk.init(args)
    end
 
    local req = wrk.format()
+   if (wrk.pipeline or 1) > 1 then
+      req = string.rep(req, wrk.pipeline)
+   end
    wrk.request = function()
       return req
    end

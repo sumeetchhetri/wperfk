@@ -22,6 +22,11 @@ static struct config {
     bool     dynamic;
     bool     record_all_responses;
     bool     json;
+    bool     delay;
+    bool     duration_set;
+    uint64_t requests;
+    uint64_t warmup;
+    uint64_t bailout;
     char    *method;
     char    *body;
     size_t   body_len;
@@ -49,7 +54,16 @@ static struct http_parser_settings parser_settings = {
 
 static volatile sig_atomic_t stop = 0;
 
+// Run-level stop reasons and shared counters (updated atomically by threads).
+enum { STOP_DURATION, STOP_REQUESTS, STOP_BAILOUT, STOP_SIGNAL };
+static const char *stop_names[] = { "duration", "requests", "bailout", "signal" };
+static volatile int stopped_by = STOP_DURATION;
+static uint64_t responses_total = 0;
+static uint64_t errors_total    = 0;
+static uint64_t warmup_end      = 0;
+
 static void handler(int sig) {
+    stopped_by = STOP_SIGNAL;
     stop = 1;
 }
 
@@ -71,6 +85,11 @@ static void usage() {
            "    -v, --version          Print version details      \n"
            "    -R, --rate        <T>  constant rate in requests/sec (total).   \n"
            "                           Omit for closed-loop max throughput.     \n"
+           "                           Also N/<dur>: 50/1s, 3000/1m, 5/100ms     \n"
+           "    -p, --pipeline    <N>  Pipeline N requests per connection       \n"
+           "    -n, --requests    <N>  Stop after N responses (no -d: no limit) \n"
+           "        --warmup      <T>  Warm up for T, excluded from results     \n"
+           "        --bailout     <N>  Stop after N errors (exit code 2)        \n"
            "    -m, --method      <M>  HTTP method (default GET)                \n"
            "        --body        <S>  Request body                             \n"
            "        --body-file   <F>  Request body from file                   \n"
@@ -97,7 +116,7 @@ int main(int argc, char **argv) {
         dup2(STDERR_FILENO, STDOUT_FILENO);
     }
 
-    script_request_defaults(cfg.method, cfg.body, cfg.body_len);
+    script_request_defaults(cfg.method, cfg.body, cfg.body_len, cfg.pipeline);
 
     char *schema  = copy_url_part(url, &parts, UF_SCHEMA);
     char *host    = copy_url_part(url, &parts, UF_HOST);
@@ -138,7 +157,11 @@ int main(int argc, char **argv) {
     
     uint64_t connections = cfg.connections / cfg.threads;
     double throughput    = (double)cfg.rate / cfg.threads;
-    uint64_t stop_at     = time_us() + (cfg.duration * 1000000);
+    if (cfg.requests && !cfg.duration_set) {
+        cfg.duration = 100 * 365 * 24 * 3600ULL; // -n without -d: run until N responses
+    }
+    warmup_end           = time_us() + (cfg.warmup * 1000000);
+    uint64_t stop_at     = warmup_end + (cfg.duration * 1000000);
 
     for (uint64_t i = 0; i < cfg.threads; i++) {
         thread *t = &threads[i];
@@ -151,8 +174,17 @@ int main(int argc, char **argv) {
         script_init(L, t, argc - optind, &argv[optind]);
 
         if (i == 0) {
+            uint64_t pipeline = cfg.pipeline;
             cfg.pipeline = script_verify_request(t->L);
             cfg.dynamic = !script_is_static(t->L);
+            if (pipeline > 1 && cfg.dynamic) {
+                fprintf(stderr, "warning: -p ignored, script defines request()\n");
+            }
+            cfg.delay = script_has_delay(t->L);
+            if (cfg.delay && cfg.rate) {
+                fprintf(stderr, "warning: script delay() ignored in -R mode (the rate scheduler paces requests)\n");
+                cfg.delay = false;
+            }
             if (script_want_response(t->L)) {
                 parser_settings.on_header_field = header_field;
                 parser_settings.on_header_value = header_value;
@@ -174,8 +206,15 @@ int main(int argc, char **argv) {
     sigfillset(&sa.sa_mask);
     sigaction(SIGINT, &sa, NULL);
 
-    char *time = format_time_s(cfg.duration);
-    printf("Running %s test @ %s\n", time, url);
+    if (cfg.requests && !cfg.duration_set) {
+        printf("Running until %"PRIu64" responses @ %s\n", cfg.requests, url);
+    } else {
+        char *time = format_time_s(cfg.duration);
+        printf("Running %s test @ %s\n", time, url);
+    }
+    if (cfg.warmup) {
+        printf("  %"PRIu64"s warmup (excluded from results)\n", cfg.warmup);
+    }
     printf("  %"PRIu64" threads and %"PRIu64" connections\n",
             cfg.threads, cfg.connections);
     if (cfg.rate) {
@@ -184,7 +223,7 @@ int main(int argc, char **argv) {
         printf("  Mode: closed loop, max throughput (latency NOT corrected for coordinated omission)\n");
     }
 
-    uint64_t start    = time_us();
+    uint64_t start    = warmup_end;
     uint64_t complete = 0;
     uint64_t bytes    = 0;
     errors errors     = { 0 };
@@ -277,6 +316,11 @@ int main(int argc, char **argv) {
         fclose(json_out);
     }
 
+    if (stopped_by == STOP_BAILOUT) {
+        fflush(stdout);
+        fprintf(stderr, "Bailed out after %"PRIu64" errors\n", errors_total);
+        return 2;
+    }
     return 0;
 }
 
@@ -324,6 +368,13 @@ void *thread_main(void *arg) {
         aeCreateTimeEvent(loop, thread->interval, sample_rate, thread, NULL);
     }
     aeCreateTimeEvent(loop, timeout_delay, check_timeouts, thread, NULL);
+    aeCreateTimeEvent(loop, LIMITS_INTERVAL_MS, check_limits, thread, NULL);
+    if (cfg.warmup) {
+        uint64_t now = time_us();
+        thread->warming = true;
+        aeCreateTimeEvent(loop, warmup_end > now ? (warmup_end - now) / 1000 : 0,
+                          end_warmup, thread, NULL);
+    }
 
     thread->start = time_us();
     aeMain(loop);
@@ -367,6 +418,7 @@ static int connect_socket(thread *thread, connection *c) {
 }
 
 static int reconnect_socket(thread *thread, connection *c) {
+    if (cfg.bailout) report_errors(thread); // every connect/read/write error path lands here
     aeDeleteFileEvent(thread->loop, c->fd, AE_WRITABLE | AE_READABLE);
     sock.close(c);
     close(c->fd);
@@ -407,6 +459,45 @@ static int calibrate(aeEventLoop *loop, long long id, void *data) {
     return AE_NOMORE;
 }
 
+static void report_errors(thread *thread) {
+    errors *e = &thread->errors;
+    uint64_t sum = (uint64_t) e->connect + e->read + e->write + e->timeout + e->status;
+    if (sum > thread->errors_reported) {
+        uint64_t total = __sync_add_and_fetch(&errors_total, sum - thread->errors_reported);
+        thread->errors_reported = sum;
+        if (cfg.bailout && total >= cfg.bailout && !stop) {
+            stopped_by = STOP_BAILOUT;
+            stop = 1;
+        }
+    }
+}
+
+static int check_limits(aeEventLoop *loop, long long id, void *data) {
+    thread *thread = data;
+    report_errors(thread);
+    if (stop) {
+        aeStop(loop);
+    }
+    return LIMITS_INTERVAL_MS;
+}
+
+static int end_warmup(aeEventLoop *loop, long long id, void *data) {
+    thread *thread = data;
+    report_errors(thread); // warmup errors still count towards --bailout
+
+    thread->complete = 0;
+    thread->requests = 0;
+    thread->bytes    = 0;
+    memset(&thread->errors, 0, sizeof(thread->errors));
+    memset(thread->status_codes, 0, sizeof(thread->status_codes));
+    thread->errors_reported = 0;
+    hdr_reset(thread->latency_histogram);
+    hdr_reset(thread->u_latency_histogram);
+    thread->start   = time_us();
+    thread->warming = false;
+    return AE_NOMORE;
+}
+
 static int check_timeouts(aeEventLoop *loop, long long id, void *data) {
     thread *thread = data;
     connection *c  = thread->cs;
@@ -433,9 +524,11 @@ static int sample_rate(aeEventLoop *loop, long long id, void *data) {
     uint64_t elapsed_ms = (time_us() - thread->start) / 1000;
     uint64_t requests = (thread->requests / (double) elapsed_ms) * 1000;
 
-    pthread_mutex_lock(&statistics.mutex);
-    stats_record(statistics.requests, requests);
-    pthread_mutex_unlock(&statistics.mutex);
+    if (!thread->warming) {
+        pthread_mutex_lock(&statistics.mutex);
+        stats_record(statistics.requests, requests);
+        pthread_mutex_unlock(&statistics.mutex);
+    }
 
     thread->requests = 0;
     thread->start    = time_us();
@@ -527,12 +620,28 @@ static int response_complete(http_parser *parser) {
     thread *thread = c->thread;
     uint64_t now = time_us();
     int status = parser->status_code;
+    bool last = false;
+
+    if (stop) {
+        aeStop(thread->loop);
+        goto done;
+    }
+
+    if (cfg.requests && !thread->warming) {
+        uint64_t n = __sync_add_and_fetch(&responses_total, 1);
+        if (n > cfg.requests) {
+            aeStop(thread->loop);
+            goto done;
+        }
+        last = (n == cfg.requests);
+    }
 
     thread->complete++;
     thread->requests++;
 
     if (status > 399) {
         thread->errors.status++;
+        if (cfg.bailout) report_errors(thread);
     }
     if (status > 0 && status < 600) {
         thread->status_codes[status]++;
@@ -603,6 +712,12 @@ static int response_complete(http_parser *parser) {
         hdr_record_value(thread->u_latency_histogram, actual_latency_timing);
     }
 
+    if (last) {
+        stopped_by = STOP_REQUESTS;
+        stop = 1;
+        aeStop(thread->loop);
+    }
+
 
     if (!http_should_keep_alive(parser)) {
         reconnect_socket(thread, c);
@@ -654,6 +769,16 @@ static void socket_writeable(aeEventLoop *loop, int fd, void *data, int mask) {
                     thread->loop, msec_to_wait, delay_request, c, NULL);
             return;
         }
+        if (cfg.delay && !c->delayed) {
+            uint64_t msec = script_delay(thread->L);
+            if (msec > 0) {
+                c->delayed = true;
+                aeDeleteFileEvent(loop, fd, AE_WRITABLE);
+                aeCreateTimeEvent(thread->loop, msec, delay_request, c, NULL);
+                return;
+            }
+        }
+        c->delayed = false;
         c->latest_write = time_us();
     }
 
@@ -718,9 +843,10 @@ static void socket_readable(aeEventLoop *loop, int fd, void *data, int mask) {
 }
 
 static uint64_t time_us() {
-    struct timeval t;
-    gettimeofday(&t, NULL);
-    return (t.tv_sec * 1000000) + t.tv_usec;
+    // Monotonic: immune to NTP/wall-clock steps during a run.
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return ((uint64_t) t.tv_sec * 1000000) + (t.tv_nsec / 1000);
 }
 
 static char *copy_url_part(char *url, struct http_parser_url *parts, enum http_parser_url_fields field) {
@@ -753,6 +879,10 @@ static struct option longopts[] = {
     { "body",           required_argument, NULL, OPT_BODY },
     { "body-file",      required_argument, NULL, OPT_BODY_FILE },
     { "json",           no_argument,       NULL, OPT_JSON },
+    { "pipeline",       required_argument, NULL, 'p' },
+    { "requests",       required_argument, NULL, 'n' },
+    { "warmup",         required_argument, NULL, OPT_WARMUP },
+    { "bailout",        required_argument, NULL, OPT_BAILOUT },
     { NULL,             0,                 NULL,  0  }
 };
 
@@ -768,7 +898,7 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
     cfg->rate        = 0;
     cfg->record_all_responses = true;
 
-    while ((c = getopt_long(argc, argv, "t:c:d:s:H:T:R:m:LUBrv?", longopts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "t:c:d:s:H:T:R:m:p:n:LUBrv?", longopts, NULL)) != -1) {
         switch (c) {
             case 't':
                 if (scan_metric(optarg, &cfg->threads)) return -1;
@@ -778,6 +908,7 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
                 break;
             case 'd':
                 if (scan_time(optarg, &cfg->duration)) return -1;
+                cfg->duration_set = true;
                 break;
             case 's':
                 cfg->script = optarg;
@@ -800,7 +931,22 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
                 cfg->timeout *= 1000;
                 break;
             case 'R':
-                if (scan_metric(optarg, &cfg->rate)) return -1;
+                if (scan_rate(optarg, &cfg->rate)) {
+                    fprintf(stderr, "invalid rate %s (use N or N/<dur>, e.g. 50/1s, 3000/1m; >= 1 req/s)\n", optarg);
+                    return -1;
+                }
+                break;
+            case 'p':
+                if (scan_metric(optarg, &cfg->pipeline) || !cfg->pipeline) return -1;
+                break;
+            case 'n':
+                if (scan_metric(optarg, &cfg->requests) || !cfg->requests) return -1;
+                break;
+            case OPT_WARMUP:
+                if (scan_time(optarg, &cfg->warmup)) return -1;
+                break;
+            case OPT_BAILOUT:
+                if (scan_metric(optarg, &cfg->bailout) || !cfg->bailout) return -1;
                 break;
             case 'm':
                 cfg->method = optarg;
@@ -903,6 +1049,34 @@ static void print_stats_latency(stats *stats) {
     }
 }
 
+static int scan_rate(char *s, uint64_t *rate) {
+    char *slash = strchr(s, '/');
+    if (!slash) {
+        return scan_metric(s, rate) || *rate == 0 ? -1 : 0;
+    }
+
+    uint64_t n;
+    *slash = '\0';
+    int rc = scan_metric(s, &n);
+    *slash = '/';
+    if (rc) return -1;
+
+    char *unit = slash + 1, *end;
+    double per = isdigit((unsigned char) *unit) ? strtod(unit, &end) : (end = unit, 1.0);
+    double scale;
+    if      (!strcmp(end, "ms")) scale = 0.001;
+    else if (!strcmp(end, "s"))  scale = 1;
+    else if (!strcmp(end, "m"))  scale = 60;
+    else if (!strcmp(end, "h"))  scale = 3600;
+    else return -1;
+    if (per <= 0) return -1;
+
+    double r = n / (per * scale);
+    if (r < 1) return -1;
+    *rate = (uint64_t) (r + 0.5);
+    return 0;
+}
+
 static int read_file(const char *path, char **data, size_t *len) {
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
@@ -955,7 +1129,11 @@ static void print_json(FILE *out, char *url, uint64_t runtime_us, uint64_t compl
     json_string(out, url);
     fprintf(out, ",\"mode\":\"%s\",\"rate\":%"PRIu64
                  ",\"threads\":%"PRIu64",\"connections\":%"PRIu64",\"duration_s\":%"PRIu64,
-            cfg.rate ? "rate" : "closed", cfg.rate, cfg.threads, cfg.connections, cfg.duration);
+            cfg.rate ? "rate" : "closed", cfg.rate, cfg.threads, cfg.connections,
+            cfg.duration_set || !cfg.requests ? cfg.duration : 0);
+    fprintf(out, ",\"pipeline\":%"PRIu64",\"warmup_s\":%"PRIu64",\"requests_limit\":%"PRIu64
+                 ",\"bailout\":%"PRIu64",\"stopped_by\":\"%s\"",
+            cfg.pipeline, cfg.warmup, cfg.requests, cfg.bailout, stop_names[stopped_by]);
     fprintf(out, ",\"runtime_us\":%"PRIu64",\"requests\":%"PRIu64",\"bytes\":%"PRIu64
                  ",\"requests_per_sec\":%.2f,\"bytes_per_sec\":%.2f",
             runtime_us, complete, bytes,

@@ -55,4 +55,28 @@ check_json json-cli-request 200 -m POST --body-file "$tmp/body" -H "X-Test: 1" $
 check_json json-cli-negative 400 --body-file "$tmp/body" -H "X-Test: 1" $U
 check_json json-rate-mode 200 -R50 http://127.0.0.1:$HTTP/
 check_json json-lua-print 200 -s scripts/report.lua http://127.0.0.1:$HTTP/
+
+# P1b: -n, rate units, delay(), -p, --warmup, --bailout, stats(p)
+expect() { # name, python-expr over d (JSON) and rc, args...
+  local name=$1 cond=$2; shift 2
+  "$BIN" --json "$@" 2>"$tmp/err" > "$tmp/out.json"; local rc=$?
+  if $PY -c "import json,sys; d=json.load(open(sys.argv[1])); rc=int(sys.argv[2]); sys.exit(0 if ($cond) else 1)" "$tmp/out.json" $rc
+  then echo "ok   $name"; else echo "FAIL $name (rc=$rc)"; cat "$tmp/out.json" "$tmp/err"; fail=1; fi
+}
+B=http://127.0.0.1:$HTTP/
+printf 'function delay() return 100 end\n' > "$tmp/delay.lua"
+cat > "$tmp/stats.lua" <<'LUA'
+done = function(s, latency, r)
+  assert(latency(99) == latency:percentile(99))
+  io.stderr:write("STATS_OK\n")
+end
+LUA
+expect requests-exact   "d['requests']==50 and d['stopped_by']=='requests' and rc==0" -t2 -c4 -n 50 $B
+expect rate-units       "d['rate']==50 and 80<=d['requests']<=120"                   -t1 -c2 -d2s -R 3000/1m $B
+expect delay            "10<=d['requests']<=25"                                        -t1 -c1 -d2s -s "$tmp/delay.lua" $B
+expect pipeline         "d['pipeline']==4 and set(d['status_codes'])=={'200'}"        -t1 -c2 -d1s -p 4 $B
+expect warmup           "80<=d['requests']<=120 and d['runtime_us']<2500000"          -t1 -c2 -R 50 --warmup 1s -d 2s $B
+expect bailout          "d['stopped_by']=='bailout' and d['errors']['total']==5 and rc==2" -t2 -c4 -d30s --bailout 5 http://127.0.0.1:$HTTP/expect-post
+expect stats-call       "open(sys.argv[1]).read() and True"                            -t1 -c2 -d1s -s "$tmp/stats.lua" $B
+grep -q STATS_OK "$tmp/err" || { echo "FAIL stats-call (assert)"; cat "$tmp/err"; fail=1; }
 exit $fail

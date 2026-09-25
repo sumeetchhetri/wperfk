@@ -10,7 +10,7 @@
 #include "wrk.h"
 
 lua_State *script_create(char *, char *, char **);
-void script_request_defaults(const char *, const char *, size_t);
+void script_request_defaults(const char *, const char *, size_t, uint64_t);
 
 bool script_resolve(lua_State *, char *, char *);
 void script_setup(lua_State *, thread *);
@@ -23,6 +23,8 @@ size_t script_verify_request(lua_State *L);
 
 bool script_is_static(lua_State *);
 bool script_want_response(lua_State *L);
+bool script_has_delay(lua_State *L);
+uint64_t script_delay(lua_State *L);
 bool script_has_done(lua_State *L);
 void script_summary(lua_State *, uint64_t, uint64_t, uint64_t);
 void script_errors(lua_State *, errors *);

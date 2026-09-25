@@ -33,6 +33,9 @@
 #define OPT_BODY      256
 #define OPT_BODY_FILE 257
 #define OPT_JSON      258
+#define OPT_WARMUP    259
+#define OPT_BAILOUT   260
+#define LIMITS_INTERVAL_MS 100
 
 typedef struct {
     pthread_t thread;
@@ -53,6 +56,8 @@ typedef struct {
     lua_State *L;
     errors errors;
     uint64_t status_codes[600];
+    uint64_t errors_reported;
+    bool warming;
     struct connection *cs;
 } thread;
 
@@ -87,6 +92,7 @@ typedef struct connection {
     char buf[RECVBUF];
     uint64_t actual_latency_start;
     bool has_pending;
+    bool delayed;
     bool caught_up;
     // Internal tracking numbers (used purely for debugging):
     uint64_t latest_should_send_time;

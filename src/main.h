@@ -48,6 +48,10 @@ static int response_body(http_parser *, const char *, size_t);
 static uint64_t time_us();
 
 static int read_file(const char *, char **, size_t *);
+static int scan_rate(char *, uint64_t *);
+static void report_errors(thread *);
+static int check_limits(aeEventLoop *, long long, void *);
+static int end_warmup(aeEventLoop *, long long, void *);
 static int parse_args(struct config *, char **, struct http_parser_url *, char **, int, char **);
 static char *copy_url_part(char *, struct http_parser_url *, enum http_parser_url_fields);
 static void print_stats_header();

@@ -15,12 +15,14 @@ static struct {
     const char *method;
     const char *body;
     size_t      body_len;
+    uint64_t    pipeline;
 } request_defaults;
 
-void script_request_defaults(const char *method, const char *body, size_t body_len) {
+void script_request_defaults(const char *method, const char *body, size_t body_len, uint64_t pipeline) {
     request_defaults.method   = method;
     request_defaults.body     = body;
     request_defaults.body_len = body_len;
+    request_defaults.pipeline = pipeline;
 }
 
 typedef struct {
@@ -32,6 +34,7 @@ typedef struct {
 static int script_addr_tostring(lua_State *);
 static int script_addr_gc(lua_State *);
 static int script_stats_len(lua_State *);
+static int script_stats_percentile(lua_State *);
 static int script_stats_get(lua_State *);
 static int script_thread_index(lua_State *);
 static int script_thread_newindex(lua_State *);
@@ -50,6 +53,7 @@ static const luaL_Reg addrlib[] = {
 };
 
 static const luaL_Reg statslib[] = {
+    { "__call",     script_stats_percentile },
     { "__index",    script_stats_get       },
     { "__len",      script_stats_len       },
     { NULL,         NULL                   }
@@ -127,6 +131,10 @@ lua_State *script_create(char *file, char *url, char **headers) {
     if (request_defaults.body) {
         lua_pushlstring(L, request_defaults.body, request_defaults.body_len);
         lua_setfield(L, 4, "body");
+    }
+    if (request_defaults.pipeline > 1) {
+        lua_pushnumber(L, (lua_Number) request_defaults.pipeline);
+        lua_setfield(L, 4, "pipeline");
     }
     lua_pop(L, 4);
 
@@ -223,6 +231,18 @@ bool script_is_function(lua_State *L, char *name) {
 
 bool script_is_static(lua_State *L) {
     return !script_is_function(L, "request");
+}
+
+bool script_has_delay(lua_State *L) {
+    return script_is_function(L, "delay");
+}
+
+uint64_t script_delay(lua_State *L) {
+    lua_getglobal(L, "delay");
+    lua_call(L, 0, 1);
+    lua_Number ms = lua_tonumber(L, -1);
+    lua_pop(L, 1);
+    return ms > 0 ? (uint64_t) ms : 0;
 }
 
 bool script_want_response(lua_State *L) {
