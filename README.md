@@ -13,7 +13,7 @@ wperfk brings together the best of the four tools most engineers reach for:
 
 Existing wrk/wrk2 Lua scripts run unmodified.
 
-> **Status: pre-alpha.** P0 and P1 are done: wrk and wrk2 modes in one binary, the combined Lua API, autocannon/vegeta-style flags, and `--json` for [GATF](https://github.com/sumeetchhetri/gatf). Windows (P2) is next. See the [roadmap](#roadmap).
+> **Status: pre-alpha.** P0 and P1 are done: wrk and wrk2 modes in one binary, the combined Lua API, autocannon/vegeta-style flags, and `--json` for [GATF](https://github.com/sumeetchhetri/gatf). P2 adds native Windows builds (x64 and ARM64). See the [roadmap](#roadmap).
 
 ## Why this exists
 
@@ -172,7 +172,20 @@ make STATIC=1 VERSION=x.y # release-style build (use Alpine/musl on Linux)
 tests/smoke.sh ./wperfk   # HTTP, HTTPS and every script in scripts/
 ```
 
-Windows builds arrive in P2.
+On Windows, build in an [MSYS2](https://www.msys2.org) UCRT64 shell (CLANGARM64 on ARM64):
+
+```sh
+pacman -S --needed make git zip mingw-w64-ucrt-x86_64-toolchain mingw-w64-ucrt-x86_64-openssl
+make STATIC=1                    # produces wperfk.exe; CLANGARM64: make STATIC=1 CC=clang
+```
+
+Cross-compiling for Windows from Linux (MinGW-w64) needs a host LuaJIT 2.1 for the embedded bytecode:
+
+```sh
+make STATIC=1 CC=x86_64-w64-mingw32-gcc-posix WITH_OPENSSL=/path/to/mingw/openssl \
+     HOST_LUAJIT=/path/to/host/luajit \
+     LUAJIT_MAKEFLAGS="CC=gcc HOST_CC=gcc CROSS=x86_64-w64-mingw32- TARGET_SYS=Windows"
+```
 
 ## Roadmap
 
@@ -181,8 +194,8 @@ Windows builds arrive in P2.
 | P0 | Bootstrap from wrk2; LuaJIT 2.1; Apple Silicon and OpenSSL 3 fixes; CI (Linux x64/arm64, macOS arm64) with smoke tests | ✅ done |
 | P1a | Optional `-R` (closed loop without it), `-m`, `--body`, `--body-file`, `--json` with status-code breakdown, static-safe embedded Lua module, release workflow and asset naming | ✅ done |
 | P1b | `delay()`, `stats(p)`, monotonic clock, `-p`, `-n`, `--warmup`, `--bailout`, rate units, 100 ms stop latency | ✅ done |
-| P2 | Windows x64: wepoll backend, Winsock shims, Ctrl+C handling | next |
-| P3 | Release matrix: static musl Linux, macOS universal, Windows x64/arm64, FreeBSD; checksums + build attestations | |
+| P2 | Windows x64 and ARM64: wepoll backend, Winsock shims, Ctrl+C handling, CI and release | ✅ done |
+| P3 | Release hardening: macOS universal binary and older-macOS support, FreeBSD, stripped binaries | next |
 | P4 | Homebrew tap, Scoop bucket, winget | |
 | P5 | `--progress`, `--targets`, `--hist-out` + `merge`, `--expect-*`, mTLS/SNI/verify, `--resolve` | |
 | P6 | Unix sockets / named pipes, HAR converter, Prometheus exporter, llhttp to replace archived `http_parser` | |
@@ -190,7 +203,8 @@ Windows builds arrive in P2.
 ## Known limitations
 
 - **Platform coverage follows LuaJIT:** x86/x64, arm64, ppc, mips. riscv64 is not supported upstream; a PUC Lua 5.1 fallback build is planned, but scripts using `ffi` won't run on it.
-- **Windows throughput will be lower than Linux** on the same hardware. Widen the ephemeral port range for high connection counts. wepoll relies on the undocumented AFD interface, as libuv does.
+- **Windows throughput will be lower than Linux** on the same hardware. For high connection counts, widen the ephemeral port range: `netsh int ipv4 set dynamicport tcp start=10000 num=55535`. wepoll relies on the undocumented AFD interface, as libuv does.
+- **On Windows, output uses CRLF line endings,** including `--json`. It is still valid JSON.
 - **`http_parser` is archived upstream.** Replacing it with llhttp is planned for P6.
 
 ## Credits

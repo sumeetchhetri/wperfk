@@ -61,3 +61,43 @@ jobs:
           file wperfk
       - name: Smoke test
         run: tests/smoke.sh ./wperfk
+
+  windows:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: windows-x86_64, runner: windows-2025,   msystem: UCRT64,     cc: gcc }
+          - { name: windows-arm64,  runner: windows-11-arm, msystem: CLANGARM64, cc: clang }
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.msystem }}
+          update: true
+          install: make git zip
+          pacboy: toolchain:p openssl:p python:p
+      - name: Build (static, same recipe as release)
+        run: make -j4 STATIC=1 CC=${{ matrix.cc }}
+      - name: Version
+        run: ./wperfk.exe -v || true
+      - name: Check DLL imports (system DLLs only)
+        run: |
+          objdump -p wperfk.exe | grep "DLL Name" | sort -u
+          if objdump -p wperfk.exe | grep "DLL Name" | grep -qiE "libssl|libcrypto|libwinpthread|libgcc|libc\+\+"; then
+            echo "::error::wperfk.exe depends on non-system DLLs"; exit 1
+          fi
+      - name: Smoke test
+        run: tests/smoke.sh ./wperfk.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wperfk-${{ matrix.name }}
+          path: wperfk.exe

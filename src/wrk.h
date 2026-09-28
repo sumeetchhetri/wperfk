@@ -9,6 +9,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "compat.h"
+
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <lua.h>

@@ -46,7 +46,9 @@
 
 /* Include the best multiplexing layer supported by this system.
  * The following should be ordered by performances, descending. */
-#ifdef HAVE_EVPORT
+#ifdef HAVE_WEPOLL
+#include "ae_wepoll.c"
+#elif defined(HAVE_EVPORT)
 #include "ae_evport.c"
 #else
     #ifdef HAVE_EPOLL

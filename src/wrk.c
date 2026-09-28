@@ -7,7 +7,7 @@
 #include "stats.h"
 
 // Max recordable latency of 1 day
-#define MAX_LATENCY 24L * 60 * 60 * 1000000
+#define MAX_LATENCY (24LL * 60 * 60 * 1000000)
 
 static struct config {
     uint64_t threads;
@@ -109,6 +109,11 @@ int main(int argc, char **argv) {
         exit(1);
     }
 
+    if (wpk_net_init()) {
+        fprintf(stderr, "unable to initialize networking\n");
+        exit(1);
+    }
+
     FILE *json_out = NULL;
     if (cfg.json) {
         fflush(stdout);
@@ -138,7 +143,9 @@ int main(int argc, char **argv) {
 	
     cfg.host = host;
 	
+#ifdef SIGPIPE
     signal(SIGPIPE, SIG_IGN);
+#endif
     signal(SIGINT,  SIG_IGN);
 
     pthread_mutex_init(&statistics.mutex, NULL);
@@ -199,12 +206,19 @@ int main(int argc, char **argv) {
         }
     }
 
+#ifdef _WIN32
+    // Ctrl+C / Ctrl+Break: the CRT runs the handler on its own thread;
+    // event loops see `stop` within LIMITS_INTERVAL_MS.
+    signal(SIGINT,   handler);
+    signal(SIGBREAK, handler);
+#else
     struct sigaction sa = {
         .sa_handler = handler,
         .sa_flags   = 0,
     };
     sigfillset(&sa.sa_mask);
     sigaction(SIGINT, &sa, NULL);
+#endif
 
     if (cfg.requests && !cfg.duration_set) {
         printf("Running until %"PRIu64" responses @ %s\n", cfg.requests, url);
@@ -390,17 +404,16 @@ static int connect_socket(thread *thread, connection *c) {
     struct aeEventLoop *loop = thread->loop;
     int fd, flags;
 
-    fd = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
+    fd = wpk_socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
+    if (fd < 0) goto error;
 
-    flags = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    wpk_nonblock(fd);
 
-    if (connect(fd, addr->ai_addr, addr->ai_addrlen) == -1) {
-        if (errno != EINPROGRESS) goto error;
+    if (wpk_connect(fd, addr->ai_addr, addr->ai_addrlen) == -1) {
+        if (!wpk_connect_pending()) goto error;
     }
 
-    flags = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flags, sizeof(flags));
+    wpk_nodelay(fd);
 
     c->latest_connect = time_us();
 
@@ -413,7 +426,7 @@ static int connect_socket(thread *thread, connection *c) {
 
   error:
     thread->errors.connect++;
-    close(fd);
+    if (fd >= 0) wpk_close(fd);
     return -1;
 }
 
@@ -421,7 +434,7 @@ static int reconnect_socket(thread *thread, connection *c) {
     if (cfg.bailout) report_errors(thread); // every connect/read/write error path lands here
     aeDeleteFileEvent(thread->loop, c->fd, AE_WRITABLE | AE_READABLE);
     sock.close(c);
-    close(c->fd);
+    wpk_close(c->fd);
     return connect_socket(thread, c);
 }
 
@@ -844,9 +857,17 @@ static void socket_readable(aeEventLoop *loop, int fd, void *data, int mask) {
 
 static uint64_t time_us() {
     // Monotonic: immune to NTP/wall-clock steps during a run.
+#ifdef _WIN32
+    LARGE_INTEGER count, freq;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&count);
+    return ((uint64_t) (count.QuadPart / freq.QuadPart) * 1000000) +
+           ((uint64_t) (count.QuadPart % freq.QuadPart) * 1000000 / freq.QuadPart);
+#else
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
     return ((uint64_t) t.tv_sec * 1000000) + (t.tv_nsec / 1000);
+#endif
 }
 
 static char *copy_url_part(char *url, struct http_parser_url *parts, enum http_parser_url_fields field) {

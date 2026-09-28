@@ -6,7 +6,8 @@ BIN=${1:-./wperfk}
 PY=${PYTHON:-python3}
 HTTP=18080; HTTPS=18443
 tmp=$(mktemp -d)
-openssl req -x509 -newkey rsa:2048 -nodes -keyout "$tmp/k.pem" -out "$tmp/c.pem" \
+# MSYS2 would rewrite /CN=... as a path for native openssl.exe; no-op elsewhere.
+MSYS2_ARG_CONV_EXCL='/CN=' openssl req -x509 -newkey rsa:2048 -nodes -keyout "$tmp/k.pem" -out "$tmp/c.pem" \
   -days 1 -subj /CN=localhost >/dev/null 2>&1
 $PY tests/server.py $HTTP </dev/null >/dev/null 2>&1 & p1=$!
 $PY tests/server.py $HTTPS "$tmp/c.pem" "$tmp/k.pem" </dev/null >/dev/null 2>&1 & p2=$!

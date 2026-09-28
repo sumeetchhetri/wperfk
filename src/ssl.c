@@ -7,6 +7,7 @@
 #include <openssl/ssl.h>
 
 #include "ssl.h"
+#include "compat.h"
 
 #if OPENSSL_VERSION_NUMBER < 0x10100000L
 #define TLS_client_method SSLv23_client_method
@@ -58,7 +59,7 @@ SSL_CTX *ssl_init() {
 
 status ssl_connect(connection *c, char *host) {
     int r;
-    SSL_set_fd(c->ssl, c->fd);
+    SSL_set_fd(c->ssl, wpk_ssl_fd(c->fd));
     SSL_set_tlsext_host_name(c->ssl, host);
     if ((r = SSL_connect(c->ssl)) != 1) {
         switch (SSL_get_error(c->ssl, r)) {

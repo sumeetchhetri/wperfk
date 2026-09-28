@@ -8,6 +8,8 @@
 #define _POSIX_C_SOURCE 200809L
 #elif defined (__sun)
 #define HAVE_EVPORT
+#elif defined(_WIN32)
+#define HAVE_WEPOLL
 #endif
 
 #endif /* CONFIG_H */
