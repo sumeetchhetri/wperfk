@@ -909,6 +909,7 @@ static struct option longopts[] = {
 
 static int parse_args(struct config *cfg, char **url, struct http_parser_url *parts, char **headers, int argc, char **argv) {
     int c;
+    bool version = false;
     char **header = headers;
 
     memset(cfg, 0, sizeof(struct config));
@@ -988,6 +989,7 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
             case 'v':
                 printf("wperfk %s [%s]\n", VERSION, aeGetApiName());
                 printf("Based on wrk2 (C) 2014 Gil Tene, Mike Barker and wrk (C) 2012 Will Glozer and Extended/Updated by Sumeet Chhetri 2026\n");
+                version = true;
                 break;
             case 'h':
             case '?':
@@ -996,6 +998,8 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
                 return -1;
         }
     }
+
+    if (version && optind == argc) exit(0); // plain `wperfk -v`
 
     if (optind == argc || !cfg->threads || !cfg->duration) return -1;
 

@@ -3,11 +3,17 @@ name: release
 on:
   push:
     tags: ['v*']
+  # Dry run: builds, tests and packages everything; publishes nothing.
+  workflow_dispatch:
 
 permissions:
   contents: write
   id-token: write
   attestations: write
+
+env:
+  OPENSSL_VERSION: 3.5.8   # keep in sync with tools/build-openssl.sh
+  MACOSX_DEPLOYMENT_TARGET: '11.0'
 
 jobs:
   build:
@@ -39,14 +45,31 @@ jobs:
             make -j4 STATIC=1 VERSION="$VERSION"'
           file wperfk
 
-      - name: Build (macOS, static OpenSSL)
+      # Homebrew's OpenSSL targets the runner's macOS; build our own for 11.0+.
+      - name: Cache OpenSSL (macOS)
+        if: matrix.os == 'darwin'
+        uses: actions/cache@v4
+        with:
+          path: ~/openssl
+          key: openssl-${{ env.OPENSSL_VERSION }}-macos${{ env.MACOSX_DEPLOYMENT_TARGET }}-${{ matrix.arch }}-v1
+
+      - name: Build (macOS 11+, static OpenSSL)
         if: matrix.os == 'darwin'
         run: |
-          brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
-          make -j4 STATIC=1 VERSION="$VERSION"
+          set -o pipefail
+          tools/build-openssl.sh "$HOME/openssl" "-mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET"
+          make -j4 STATIC=1 VERSION="$VERSION" WITH_OPENSSL="$HOME/openssl" 2>&1 | tee build.log
+          if grep -q "built for newer" build.log; then
+            echo "::error::linked objects built for a newer macOS than $MACOSX_DEPLOYMENT_TARGET"; exit 1
+          fi
           otool -L wperfk
-          if otool -L wperfk | grep -q -e homebrew -e /usr/local/opt; then
-            echo "::error::binary links against Homebrew libraries"; exit 1
+          if otool -L wperfk | grep -e homebrew -e /usr/local/opt -e /usr/local/lib; then
+            echo "::error::binary links against non-system libraries"; exit 1
+          fi
+          minos=$(otool -l wperfk | awk '/LC_BUILD_VERSION/{f=1} f && $1=="minos" {print $2; exit}')
+          echo "minos=$minos"
+          if [ "$minos" != "$MACOSX_DEPLOYMENT_TARGET" ]; then
+            echo "::error::binary requires macOS $minos, expected $MACOSX_DEPLOYMENT_TARGET"; exit 1
           fi
 
       - name: Smoke test
@@ -58,6 +81,34 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: wperfk-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/*
+
+  darwin-universal:
+    needs: build
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wperfk-darwin-*
+          path: in
+          merge-multiple: true
+
+      - name: lipo amd64 + arm64
+        run: |
+          set -euo pipefail
+          VERSION=${GITHUB_REF_NAME#v}
+          mkdir -p x86 arm
+          tar -xzf "in/wperfk_${VERSION}_darwin_amd64.tar.gz" -C x86
+          tar -xzf "in/wperfk_${VERSION}_darwin_arm64.tar.gz" -C arm
+          lipo -create -output wperfk x86/wperfk arm/wperfk
+          lipo -archs wperfk
+          tools/package.sh "$VERSION" darwin universal
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wperfk-darwin-universal
           path: dist/*
 
   build-windows:
@@ -87,10 +138,12 @@ jobs:
 
       - name: Build, test, package
         run: |
+          set -euo pipefail
           VERSION=${GITHUB_REF_NAME#v}
           make -j4 STATIC=1 CC=${{ matrix.cc }} VERSION="$VERSION"
           ./wperfk.exe -v
-          if objdump -p wperfk.exe | grep "DLL Name" | grep -qiE "libssl|libcrypto|libwinpthread|libgcc|libc\+\+"; then
+          OD=$(command -v objdump || command -v llvm-objdump)
+          if "$OD" -p wperfk.exe | grep "DLL Name" | grep -iE "libssl|libcrypto|libwinpthread|libgcc|libc\+\+"; then
             echo "::error::wperfk.exe depends on non-system DLLs"; exit 1
           fi
           tests/smoke.sh ./wperfk.exe
@@ -101,8 +154,41 @@ jobs:
           name: wperfk-windows-${{ matrix.arch }}
           path: dist/*
 
+  # Tier 2: published when it succeeds, never blocks the release.
+  build-freebsd:
+    name: freebsd-amd64
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+
+      - uses: vmactions/freebsd-vm@v1
+        with:
+          release: '14'
+          prepare: pkg install -y gmake bash python3 git
+          run: |
+            set -e
+            git config --global --add safe.directory '*'
+            VERSION=${GITHUB_REF_NAME#v}
+            gmake -j2 STATIC=1 VERSION="$VERSION"
+            file wperfk
+            bash tests/smoke.sh ./wperfk
+            bash tools/package.sh "$VERSION" freebsd amd64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wperfk-freebsd-amd64
+          path: dist/*
+
   release:
-    needs: [build, build-windows]
+    needs: [build, darwin-universal, build-windows, build-freebsd]
+    if: >-
+      ${{ !cancelled() &&
+          needs.build.result == 'success' &&
+          needs.darwin-universal.result == 'success' &&
+          needs.build-windows.result == 'success' }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
@@ -112,15 +198,25 @@ jobs:
 
       - name: Checksums
         run: |
+          [ "${{ needs.build-freebsd.result }}" = success ] || echo "::warning::FreeBSD build failed; releasing without it"
           VERSION=${GITHUB_REF_NAME#v}
           cd dist && sha256sum wperfk_* > "wperfk_${VERSION}_checksums.txt"
           cat "wperfk_${VERSION}_checksums.txt"
 
+      - name: Upload dry-run bundle
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: wperfk-release-dry-run
+          path: dist/*
+
       - uses: actions/attest-build-provenance@v2
+        if: github.event_name == 'push'
         with:
           subject-path: dist/wperfk_*
 
       - name: Publish release
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

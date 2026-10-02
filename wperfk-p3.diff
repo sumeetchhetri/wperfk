@@ -1,0 +1,402 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 9adb215..04c3fde 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -34,7 +34,7 @@ jobs:
+         run: make -j4
+ 
+       - name: Version
+-        run: ./wperfk -v || true
++        run: ./wperfk -v
+ 
+       - name: Smoke test
+         run: tests/smoke.sh ./wperfk
+@@ -86,18 +86,45 @@ jobs:
+           install: make git zip
+           pacboy: toolchain:p openssl:p python:p
+       - name: Build (static, same recipe as release)
+-        run: make -j4 STATIC=1 CC=${{ matrix.cc }}
++        run: |
++          set -euo pipefail
++          make -j4 STATIC=1 CC=${{ matrix.cc }}
+       - name: Version
+-        run: ./wperfk.exe -v || true
++        run: ./wperfk.exe -v
+       - name: Check DLL imports (system DLLs only)
+         run: |
+-          objdump -p wperfk.exe | grep "DLL Name" | sort -u
+-          if objdump -p wperfk.exe | grep "DLL Name" | grep -qiE "libssl|libcrypto|libwinpthread|libgcc|libc\+\+"; then
++          set -euo pipefail
++          OD=$(command -v objdump || command -v llvm-objdump)
++          "$OD" -p wperfk.exe | grep "DLL Name" | sort -u
++          if "$OD" -p wperfk.exe | grep "DLL Name" | grep -iE "libssl|libcrypto|libwinpthread|libgcc|libc\+\+"; then
+             echo "::error::wperfk.exe depends on non-system DLLs"; exit 1
+           fi
+       - name: Smoke test
+-        run: tests/smoke.sh ./wperfk.exe
++        run: |
++          set -euo pipefail
++          tests/smoke.sh ./wperfk.exe
+       - uses: actions/upload-artifact@v4
+         with:
+           name: wperfk-${{ matrix.name }}
+           path: wperfk.exe
++
++  freebsd:
++    name: freebsd-amd64
++    runs-on: ubuntu-24.04
++    steps:
++      - uses: actions/checkout@v4
++        with:
++          submodules: true
++          fetch-depth: 0
++      - uses: vmactions/freebsd-vm@v1
++        with:
++          release: '14'
++          copyback: false
++          prepare: pkg install -y gmake bash python3 git
++          run: |
++            set -e
++            git config --global --add safe.directory '*'
++            gmake -j2 STATIC=1
++            file wperfk
++            ./wperfk -v
++            bash tests/smoke.sh ./wperfk
+diff --git a/.github/workflows/release.yml b/.github/workflows/release.yml
+index f2abeae..fb0a1ed 100644
+--- a/.github/workflows/release.yml
++++ b/.github/workflows/release.yml
+@@ -3,12 +3,18 @@ name: release
+ on:
+   push:
+     tags: ['v*']
++  # Dry run: builds, tests and packages everything; publishes nothing.
++  workflow_dispatch:
+ 
+ permissions:
+   contents: write
+   id-token: write
+   attestations: write
+ 
++env:
++  OPENSSL_VERSION: 3.5.8   # keep in sync with tools/build-openssl.sh
++  MACOSX_DEPLOYMENT_TARGET: '11.0'
++
+ jobs:
+   build:
+     name: ${{ matrix.os }}-${{ matrix.arch }}
+@@ -39,14 +45,31 @@ jobs:
+             make -j4 STATIC=1 VERSION="$VERSION"'
+           file wperfk
+ 
+-      - name: Build (macOS, static OpenSSL)
++      # Homebrew's OpenSSL targets the runner's macOS; build our own for 11.0+.
++      - name: Cache OpenSSL (macOS)
++        if: matrix.os == 'darwin'
++        uses: actions/cache@v4
++        with:
++          path: ~/openssl
++          key: openssl-${{ env.OPENSSL_VERSION }}-macos${{ env.MACOSX_DEPLOYMENT_TARGET }}-${{ matrix.arch }}-v1
++
++      - name: Build (macOS 11+, static OpenSSL)
+         if: matrix.os == 'darwin'
+         run: |
+-          brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+-          make -j4 STATIC=1 VERSION="$VERSION"
++          set -o pipefail
++          tools/build-openssl.sh "$HOME/openssl" "-mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET"
++          make -j4 STATIC=1 VERSION="$VERSION" WITH_OPENSSL="$HOME/openssl" 2>&1 | tee build.log
++          if grep -q "built for newer" build.log; then
++            echo "::error::linked objects built for a newer macOS than $MACOSX_DEPLOYMENT_TARGET"; exit 1
++          fi
+           otool -L wperfk
+-          if otool -L wperfk | grep -q -e homebrew -e /usr/local/opt; then
+-            echo "::error::binary links against Homebrew libraries"; exit 1
++          if otool -L wperfk | grep -e homebrew -e /usr/local/opt -e /usr/local/lib; then
++            echo "::error::binary links against non-system libraries"; exit 1
++          fi
++          minos=$(otool -l wperfk | awk '/LC_BUILD_VERSION/{f=1} f && $1=="minos" {print $2; exit}')
++          echo "minos=$minos"
++          if [ "$minos" != "$MACOSX_DEPLOYMENT_TARGET" ]; then
++            echo "::error::binary requires macOS $minos, expected $MACOSX_DEPLOYMENT_TARGET"; exit 1
+           fi
+ 
+       - name: Smoke test
+@@ -60,6 +83,34 @@ jobs:
+           name: wperfk-${{ matrix.os }}-${{ matrix.arch }}
+           path: dist/*
+ 
++  darwin-universal:
++    needs: build
++    runs-on: macos-15
++    steps:
++      - uses: actions/checkout@v4
++
++      - uses: actions/download-artifact@v4
++        with:
++          pattern: wperfk-darwin-*
++          path: in
++          merge-multiple: true
++
++      - name: lipo amd64 + arm64
++        run: |
++          set -euo pipefail
++          VERSION=${GITHUB_REF_NAME#v}
++          mkdir -p x86 arm
++          tar -xzf "in/wperfk_${VERSION}_darwin_amd64.tar.gz" -C x86
++          tar -xzf "in/wperfk_${VERSION}_darwin_arm64.tar.gz" -C arm
++          lipo -create -output wperfk x86/wperfk arm/wperfk
++          lipo -archs wperfk
++          tools/package.sh "$VERSION" darwin universal
++
++      - uses: actions/upload-artifact@v4
++        with:
++          name: wperfk-darwin-universal
++          path: dist/*
++
+   build-windows:
+     name: windows-${{ matrix.arch }}
+     runs-on: ${{ matrix.runner }}
+@@ -87,10 +138,12 @@ jobs:
+ 
+       - name: Build, test, package
+         run: |
++          set -euo pipefail
+           VERSION=${GITHUB_REF_NAME#v}
+           make -j4 STATIC=1 CC=${{ matrix.cc }} VERSION="$VERSION"
+           ./wperfk.exe -v
+-          if objdump -p wperfk.exe | grep "DLL Name" | grep -qiE "libssl|libcrypto|libwinpthread|libgcc|libc\+\+"; then
++          OD=$(command -v objdump || command -v llvm-objdump)
++          if "$OD" -p wperfk.exe | grep "DLL Name" | grep -iE "libssl|libcrypto|libwinpthread|libgcc|libc\+\+"; then
+             echo "::error::wperfk.exe depends on non-system DLLs"; exit 1
+           fi
+           tests/smoke.sh ./wperfk.exe
+@@ -101,8 +154,41 @@ jobs:
+           name: wperfk-windows-${{ matrix.arch }}
+           path: dist/*
+ 
++  # Tier 2: published when it succeeds, never blocks the release.
++  build-freebsd:
++    name: freebsd-amd64
++    runs-on: ubuntu-24.04
++    steps:
++      - uses: actions/checkout@v4
++        with:
++          submodules: true
++          fetch-depth: 0
++
++      - uses: vmactions/freebsd-vm@v1
++        with:
++          release: '14'
++          prepare: pkg install -y gmake bash python3 git
++          run: |
++            set -e
++            git config --global --add safe.directory '*'
++            VERSION=${GITHUB_REF_NAME#v}
++            gmake -j2 STATIC=1 VERSION="$VERSION"
++            file wperfk
++            bash tests/smoke.sh ./wperfk
++            bash tools/package.sh "$VERSION" freebsd amd64
++
++      - uses: actions/upload-artifact@v4
++        with:
++          name: wperfk-freebsd-amd64
++          path: dist/*
++
+   release:
+-    needs: [build, build-windows]
++    needs: [build, darwin-universal, build-windows, build-freebsd]
++    if: >-
++      ${{ !cancelled() &&
++          needs.build.result == 'success' &&
++          needs.darwin-universal.result == 'success' &&
++          needs.build-windows.result == 'success' }}
+     runs-on: ubuntu-24.04
+     steps:
+       - uses: actions/download-artifact@v4
+@@ -112,15 +198,25 @@ jobs:
+ 
+       - name: Checksums
+         run: |
++          [ "${{ needs.build-freebsd.result }}" = success ] || echo "::warning::FreeBSD build failed; releasing without it"
+           VERSION=${GITHUB_REF_NAME#v}
+           cd dist && sha256sum wperfk_* > "wperfk_${VERSION}_checksums.txt"
+           cat "wperfk_${VERSION}_checksums.txt"
+ 
++      - name: Upload dry-run bundle
++        if: github.event_name == 'workflow_dispatch'
++        uses: actions/upload-artifact@v4
++        with:
++          name: wperfk-release-dry-run
++          path: dist/*
++
+       - uses: actions/attest-build-provenance@v2
++        if: github.event_name == 'push'
+         with:
+           subject-path: dist/wperfk_*
+ 
+       - name: Publish release
++        if: github.event_name == 'push'
+         env:
+           GH_TOKEN: ${{ github.token }}
+         run: |
+diff --git a/README.md b/README.md
+index bce3ee1..f7fb802 100644
+--- a/README.md
++++ b/README.md
+@@ -13,7 +13,7 @@ wperfk brings together the best of the four tools most engineers reach for:
+ 
+ Existing wrk/wrk2 Lua scripts run unmodified.
+ 
+-> **Status: pre-alpha.** P0 and P1 are done: wrk and wrk2 modes in one binary, the combined Lua API, autocannon/vegeta-style flags, and `--json` for [GATF](https://github.com/sumeetchhetri/gatf). P2 adds native Windows builds (x64 and ARM64). See the [roadmap](#roadmap).
++> **Status: pre-alpha.** P0 and P1 are done: wrk and wrk2 modes in one binary, the combined Lua API, autocannon/vegeta-style flags, and `--json` for [GATF](https://github.com/sumeetchhetri/gatf). P2 added native Windows builds (x64 and ARM64); P3 hardened the release pipeline. See the [roadmap](#roadmap).
+ 
+ ## Why this exists
+ 
+@@ -155,10 +155,21 @@ CLI `-m/--body/-H` set defaults. A `-s` script can still override them.
+ 
+ Each `v*` tag publishes:
+ 
+-- `wperfk_<version>_<os>_<arch>.tar.gz`, or `.zip` for Windows. `os` is `linux`, `darwin` or `windows`; `arch` is `amd64` or `arm64`. The binary, LICENSE, NOTICE and README sit at the archive root. Linux builds are fully static (musl); macOS builds link OpenSSL statically.
++- `wperfk_<version>_<os>_<arch>.tar.gz`, or `.zip` for Windows. `os` is `linux`, `darwin` or `windows`; `arch` is `amd64` or `arm64`. The binary, LICENSE, NOTICE and README sit at the archive root.
++- `wperfk_<version>_darwin_universal.tar.gz`: one macOS binary for both Intel and Apple Silicon.
++- `wperfk_<version>_freebsd_amd64.tar.gz` (tier 2): published when the FreeBSD build passes; it never blocks a release.
+ - `wperfk_<version>_checksums.txt`, one `sha256  filename` line per archive (`sha256sum` format).
+ - GitHub build-provenance attestations for every archive.
+ 
++| Platform | Linking | Runs on |
++|---|---|---|
++| Linux | fully static (musl) | any distro, glibc or musl |
++| macOS | OpenSSL 3.5 LTS built from source and linked statically | macOS 11 Big Sur and later |
++| Windows | fully static (MinGW, UCRT) | Windows 10 / Server 2016 and later; system DLLs only |
++| FreeBSD | fully static | FreeBSD 14 and later |
++
++Every binary is stripped, and each is smoke-tested before it is packaged. To dry-run the whole pipeline without publishing, run the `release` workflow manually from the Actions tab.
++
+ ## Building from source
+ 
+ ```sh
+@@ -195,8 +206,8 @@ make STATIC=1 CC=x86_64-w64-mingw32-gcc-posix WITH_OPENSSL=/path/to/mingw/openss
+ | P1a | Optional `-R` (closed loop without it), `-m`, `--body`, `--body-file`, `--json` with status-code breakdown, static-safe embedded Lua module, release workflow and asset naming | ✅ done |
+ | P1b | `delay()`, `stats(p)`, monotonic clock, `-p`, `-n`, `--warmup`, `--bailout`, rate units, 100 ms stop latency | ✅ done |
+ | P2 | Windows x64 and ARM64: wepoll backend, Winsock shims, Ctrl+C handling, CI and release | ✅ done |
+-| P3 | Release hardening: macOS universal binary and older-macOS support, FreeBSD, stripped binaries | next |
+-| P4 | Homebrew tap, Scoop bucket, winget | |
++| P3 | Release hardening: macOS 11+ builds (pinned OpenSSL from source), macOS universal binary, FreeBSD, stripped binaries, release dry run | ✅ done |
++| P4 | Homebrew tap, Scoop bucket, winget | next |
+ | P5 | `--progress`, `--targets`, `--hist-out` + `merge`, `--expect-*`, mTLS/SNI/verify, `--resolve` | |
+ | P6 | Unix sockets / named pipes, HAR converter, Prometheus exporter, llhttp to replace archived `http_parser` | |
+ 
+diff --git a/src/wrk.c b/src/wrk.c
+index a43fad5..b32c277 100644
+--- a/src/wrk.c
++++ b/src/wrk.c
+@@ -909,6 +909,7 @@ static struct option longopts[] = {
+ 
+ static int parse_args(struct config *cfg, char **url, struct http_parser_url *parts, char **headers, int argc, char **argv) {
+     int c;
++    bool version = false;
+     char **header = headers;
+ 
+     memset(cfg, 0, sizeof(struct config));
+@@ -988,6 +989,7 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
+             case 'v':
+                 printf("wperfk %s [%s]\n", VERSION, aeGetApiName());
+                 printf("Based on wrk2 (C) 2014 Gil Tene, Mike Barker and wrk (C) 2012 Will Glozer and Extended/Updated by Sumeet Chhetri 2026\n");
++                version = true;
+                 break;
+             case 'h':
+             case '?':
+@@ -997,6 +999,8 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
+         }
+     }
+ 
++    if (version && optind == argc) exit(0); // plain `wperfk -v`
++
+     if (optind == argc || !cfg->threads || !cfg->duration) return -1;
+ 
+     if (!script_parse_url(argv[optind], parts)) {
+diff --git a/tools/build-openssl.sh b/tools/build-openssl.sh
+new file mode 100755
+index 0000000..b0690b9
+--- /dev/null
++++ b/tools/build-openssl.sh
+@@ -0,0 +1,44 @@
++#!/usr/bin/env bash
++# Build a static OpenSSL (pinned version, verified tarball) for release builds.
++#
++# Usage: tools/build-openssl.sh <prefix> [Configure args...]
++#   e.g. MACOSX_DEPLOYMENT_TARGET=11.0 tools/build-openssl.sh "$HOME/openssl" -mmacosx-version-min=11.0
++#
++# Skips the build if <prefix>/lib/libssl.a already exists (CI cache hit).
++set -euo pipefail
++
++OPENSSL_VERSION=${OPENSSL_VERSION:-3.5.8}
++OPENSSL_SHA256=${OPENSSL_SHA256:-a8f84a39918ec6415ce765d9b429d313ba97b8143169c172e734b9514464f5b2}
++
++prefix=${1:?usage: $0 <prefix> [Configure args...]}
++shift
++
++if [ -f "$prefix/lib/libssl.a" ] && [ -f "$prefix/lib/libcrypto.a" ]; then
++  echo "OpenSSL already built in $prefix"
++  exit 0
++fi
++
++work=$(mktemp -d)
++trap 'rm -rf "$work"' EXIT
++tarball="$work/openssl-$OPENSSL_VERSION.tar.gz"
++
++curl -fsSL -o "$tarball" \
++  "https://github.com/openssl/openssl/releases/download/openssl-$OPENSSL_VERSION/openssl-$OPENSSL_VERSION.tar.gz"
++
++if command -v sha256sum >/dev/null; then
++  actual=$(sha256sum "$tarball" | cut -d' ' -f1)
++else
++  actual=$(shasum -a 256 "$tarball" | cut -d' ' -f1)
++fi
++if [ "$actual" != "$OPENSSL_SHA256" ]; then
++  echo "OpenSSL $OPENSSL_VERSION checksum mismatch: $actual" >&2
++  exit 1
++fi
++
++tar -xzf "$tarball" -C "$work"
++cd "$work/openssl-$OPENSSL_VERSION"
++./Configure no-shared no-tests no-docs no-module no-engine \
++  --prefix="$prefix" --libdir=lib "$@"
++make -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)" build_libs
++make install_dev
++echo "OpenSSL $OPENSSL_VERSION installed in $prefix"
+diff --git a/tools/package.sh b/tools/package.sh
+index 8dd29d9..67d0dee 100755
+--- a/tools/package.sh
++++ b/tools/package.sh
+@@ -2,6 +2,8 @@
+ # Usage: tools/package.sh <version> <os> <arch> [binary]
+ # Produces dist/wperfk_<version>_<os>_<arch>.tar.gz (.zip for windows)
+ # with the binary, LICENSE, NOTICE and README.md at the archive root.
++# The packaged binary is stripped (STRIP overrides the tool, e.g. for cross
++# builds; STRIP=: disables it) and, when it can run here, smoke-run with -v.
+ set -euo pipefail
+ ver=$1 os=$2 arch=$3
+ bin=${4:-wperfk}; [ "$os" = windows ] && bin=${4:-wperfk.exe}
+@@ -10,6 +12,20 @@ stage=$(mktemp -d)
+ trap 'rm -rf "$stage"' EXIT
+ mkdir -p dist
+ cp "$bin" LICENSE NOTICE README.md "$stage/"
++exe="$stage/$(basename "$bin")"
++
++strip_tool=${STRIP:-$(command -v strip || command -v llvm-strip || true)}
++if [ -n "$strip_tool" ]; then
++  "$strip_tool" "$exe"
++else
++  echo "warning: no strip tool found; packaging an unstripped binary" >&2
++fi
++if [ "$(uname -s)" = Darwin ]; then
++  codesign --force --sign - "$exe"   # arm64 needs a valid (ad-hoc) signature after strip
++fi
++if [ -z "${CROSS_PACKAGE:-}" ]; then
++  "$exe" -v >/dev/null   # the stripped binary must still start
++fi
+ if [ "$os" = windows ]; then
+   out="$PWD/dist/$name.zip"
+   if command -v zip >/dev/null; then (cd "$stage" && zip -q -9 "$out" ./*)

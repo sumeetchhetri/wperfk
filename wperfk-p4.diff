@@ -1,0 +1,266 @@
+diff --git a/.github/workflows/release.yml b/.github/workflows/release.yml
+index fb0a1ed..2ad91b1 100644
+--- a/.github/workflows/release.yml
++++ b/.github/workflows/release.yml
+@@ -223,3 +223,46 @@ jobs:
+           pre=""; case "$GITHUB_REF_NAME" in *-*) pre="--prerelease";; esac
+           gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
+             --title "$GITHUB_REF_NAME" --generate-notes $pre
++
++  # Stable tags only: refresh Formula/ (Homebrew) and bucket/ (Scoop) on main,
++  # and open a winget-pkgs PR when a WINGET_TOKEN secret is configured.
++  packages:
++    needs: release
++    if: ${{ github.event_name == 'push' && !contains(github.ref_name, '-') }}
++    runs-on: ubuntu-24.04
++    env:
++      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
++    steps:
++      - uses: actions/checkout@v4
++        with:
++          ref: main
++
++      - name: Generate Homebrew, Scoop and winget definitions
++        env:
++          GH_TOKEN: ${{ github.token }}
++        run: |
++          VERSION=${GITHUB_REF_NAME#v}
++          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
++            --pattern "wperfk_${VERSION}_checksums.txt" --dir dist
++          tools/gen-packages.sh "$VERSION" dist
++          ruby -c Formula/wperfk.rb
++          python3 -m json.tool bucket/wperfk.json > /dev/null
++
++      - name: Commit to main
++        run: |
++          git config user.name "github-actions[bot]"
++          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
++          git add Formula bucket winget
++          git diff --cached --quiet && exit 0
++          git commit -m "packages: wperfk ${GITHUB_REF_NAME#v}"
++          git push origin HEAD:main
++
++      # winget-releaser only updates packages already in winget-pkgs: submit
++      # winget/*.yaml by hand once (see README), then this keeps it current.
++      - name: winget PR
++        if: env.WINGET_TOKEN != ''
++        uses: vedantmgoyal9/winget-releaser@v2
++        with:
++          identifier: SumeetChhetri.wperfk
++          installers-regex: '_windows_(amd64|arm64)\.zip$'
++          token: ${{ secrets.WINGET_TOKEN }}
+diff --git a/README.md b/README.md
+index f7fb802..2350d8c 100644
+--- a/README.md
++++ b/README.md
+@@ -113,6 +113,27 @@ This is our reading of the licences, not legal advice. If any upstream author se
+ | Lua | LuaJIT 2.1 (pinned submodule) | same |
+ | TLS | OpenSSL 3.x | same, static |
+ 
++## Install
++
++From the first stable release:
++
++```sh
++# macOS and Linux (Homebrew)
++brew tap sumeetchhetri/wperfk https://github.com/sumeetchhetri/wperfk
++brew install wperfk
++
++# Windows (Scoop)
++scoop bucket add wperfk https://github.com/sumeetchhetri/wperfk
++scoop install wperfk
++
++# Windows (winget), once the package is accepted into winget-pkgs
++winget install SumeetChhetri.wperfk
++```
++
++Or download an archive from [Releases](https://github.com/sumeetchhetri/wperfk/releases); every binary is a single static file.
++
++Maintainers: each stable tag regenerates `Formula/`, `bucket/` and `winget/` with `tools/gen-packages.sh` and commits them to `main`. For winget, submit `winget/*.yaml` to [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs) once by hand (under `manifests/s/SumeetChhetri/wperfk/<version>/`). After that, a `WINGET_TOKEN` repository secret (a classic PAT with `public_repo`) lets the release open the update PRs.
++
+ ## Usage
+ 
+ ```
+@@ -207,8 +228,8 @@ make STATIC=1 CC=x86_64-w64-mingw32-gcc-posix WITH_OPENSSL=/path/to/mingw/openss
+ | P1b | `delay()`, `stats(p)`, monotonic clock, `-p`, `-n`, `--warmup`, `--bailout`, rate units, 100 ms stop latency | ✅ done |
+ | P2 | Windows x64 and ARM64: wepoll backend, Winsock shims, Ctrl+C handling, CI and release | ✅ done |
+ | P3 | Release hardening: macOS 11+ builds (pinned OpenSSL from source), macOS universal binary, FreeBSD, stripped binaries, release dry run | ✅ done |
+-| P4 | Homebrew tap, Scoop bucket, winget | next |
+-| P5 | `--progress`, `--targets`, `--hist-out` + `merge`, `--expect-*`, mTLS/SNI/verify, `--resolve` | |
++| P4 | Homebrew tap, Scoop bucket, winget | ✅ done |
++| P5 | `--progress`, `--targets`, `--hist-out` + `merge`, `--expect-*`, mTLS/SNI/verify, `--resolve` | next |
+ | P6 | Unix sockets / named pipes, HAR converter, Prometheus exporter, llhttp to replace archived `http_parser` | |
+ 
+ ## Known limitations
+diff --git a/tools/gen-packages.sh b/tools/gen-packages.sh
+new file mode 100755
+index 0000000..99906f9
+--- /dev/null
++++ b/tools/gen-packages.sh
+@@ -0,0 +1,166 @@
++#!/usr/bin/env bash
++# Generate package manager definitions for a published release.
++#
++# Usage: tools/gen-packages.sh <version> <dir-with-checksums.txt>
++#
++# Writes (relative to the repo root):
++#   Formula/wperfk.rb    Homebrew:  brew tap sumeetchhetri/wperfk https://github.com/sumeetchhetri/wperfk
++#   bucket/wperfk.json   Scoop:     scoop bucket add wperfk https://github.com/sumeetchhetri/wperfk
++#   winget/*.yaml        winget:    manifests for microsoft/winget-pkgs (SumeetChhetri.wperfk)
++set -euo pipefail
++
++ver=${1:?usage: $0 <version> <dir>}
++dir=${2:?usage: $0 <version> <dir>}
++repo=${REPO:-sumeetchhetri/wperfk}
++sums="$dir/wperfk_${ver}_checksums.txt"
++base="https://github.com/$repo/releases/download/v$ver"
++desc="HTTP benchmarking tool with Lua scripting: wrk and wrk2 modes in one binary"
++
++sha() { # asset name -> sha256 from the checksums file
++  local s
++  s=$(awk -v f="$1" '$2 == f || $2 == "*"f {print $1}' "$sums")
++  [ -n "$s" ] || { echo "missing $1 in $sums" >&2; exit 1; }
++  echo "$s"
++}
++
++mac=wperfk_${ver}_darwin_universal.tar.gz
++lx64=wperfk_${ver}_linux_amd64.tar.gz
++larm=wperfk_${ver}_linux_arm64.tar.gz
++wx64=wperfk_${ver}_windows_amd64.zip
++warm=wperfk_${ver}_windows_arm64.zip
++
++mkdir -p Formula bucket winget
++
++cat > Formula/wperfk.rb <<EOF
++# Generated by tools/gen-packages.sh for v$ver. Do not edit by hand.
++class Wperfk < Formula
++  desc "$desc"
++  homepage "https://github.com/$repo"
++  version "$ver"
++  license "Apache-2.0"
++
++  on_macos do
++    url "$base/$mac"
++    sha256 "$(sha "$mac")"
++  end
++
++  on_linux do
++    on_intel do
++      url "$base/$lx64"
++      sha256 "$(sha "$lx64")"
++    end
++    on_arm do
++      url "$base/$larm"
++      sha256 "$(sha "$larm")"
++    end
++  end
++
++  def install
++    bin.install "wperfk"
++    doc.install "README.md"
++  end
++
++  test do
++    assert_match "wperfk #{version}", shell_output("#{bin}/wperfk -v")
++  end
++end
++EOF
++
++cat > bucket/wperfk.json <<EOF
++{
++    "version": "$ver",
++    "description": "$desc",
++    "homepage": "https://github.com/$repo",
++    "license": "Apache-2.0",
++    "architecture": {
++        "64bit": {
++            "url": "$base/$wx64",
++            "hash": "$(sha "$wx64")"
++        },
++        "arm64": {
++            "url": "$base/$warm",
++            "hash": "$(sha "$warm")"
++        }
++    },
++    "bin": "wperfk.exe",
++    "checkver": {
++        "github": "https://github.com/$repo"
++    },
++    "autoupdate": {
++        "architecture": {
++            "64bit": {
++                "url": "https://github.com/$repo/releases/download/v\$version/wperfk_\$version_windows_amd64.zip"
++            },
++            "arm64": {
++                "url": "https://github.com/$repo/releases/download/v\$version/wperfk_\$version_windows_arm64.zip"
++            }
++        },
++        "hash": {
++            "url": "\$baseurl/wperfk_\$version_checksums.txt"
++        }
++    }
++}
++EOF
++
++id=SumeetChhetri.wperfk
++schema=1.10.0
++rm -f winget/*.yaml
++
++cat > "winget/$id.yaml" <<EOF
++# yaml-language-server: \$schema=https://aka.ms/winget-manifest.version.$schema.schema.json
++PackageIdentifier: $id
++PackageVersion: $ver
++DefaultLocale: en-US
++ManifestType: version
++ManifestVersion: $schema
++EOF
++
++installer() { # arch url sha
++  cat <<EOF
++  - Architecture: $1
++    InstallerUrl: $2
++    InstallerSha256: $(echo "$3" | tr 'a-f' 'A-F')
++EOF
++}
++
++cat > "winget/$id.installer.yaml" <<EOF
++# yaml-language-server: \$schema=https://aka.ms/winget-manifest.installer.$schema.schema.json
++PackageIdentifier: $id
++PackageVersion: $ver
++InstallerType: zip
++NestedInstallerType: portable
++NestedInstallerFiles:
++  - RelativeFilePath: wperfk.exe
++    PortableCommandAlias: wperfk
++MinimumOSVersion: 10.0.0.0
++Installers:
++$(installer x64 "$base/$wx64" "$(sha "$wx64")")
++$(installer arm64 "$base/$warm" "$(sha "$warm")")
++ManifestType: installer
++ManifestVersion: $schema
++EOF
++
++cat > "winget/$id.locale.en-US.yaml" <<EOF
++# yaml-language-server: \$schema=https://aka.ms/winget-manifest.defaultLocale.$schema.schema.json
++PackageIdentifier: $id
++PackageVersion: $ver
++PackageLocale: en-US
++Publisher: Sumeet Chhetri
++PublisherUrl: https://github.com/sumeetchhetri
++PackageName: wperfk
++PackageUrl: https://github.com/$repo
++License: Apache-2.0
++LicenseUrl: https://github.com/$repo/blob/main/LICENSE
++ShortDescription: "$desc"
++Tags:
++  - benchmark
++  - http
++  - load-testing
++  - lua
++  - wrk
++ReleaseNotesUrl: https://github.com/$repo/releases/tag/v$ver
++ManifestType: defaultLocale
++ManifestVersion: $schema
++EOF
++
++echo "Generated Formula/wperfk.rb, bucket/wperfk.json and winget/ for v$ver"

@@ -13,7 +13,7 @@ wperfk brings together the best of the four tools most engineers reach for:
 
 Existing wrk/wrk2 Lua scripts run unmodified.
 
-> **Status: pre-alpha.** P0 and P1 are done: wrk and wrk2 modes in one binary, the combined Lua API, autocannon/vegeta-style flags, and `--json` for [GATF](https://github.com/sumeetchhetri/gatf). P2 adds native Windows builds (x64 and ARM64). See the [roadmap](#roadmap).
+> **Status: pre-alpha.** P0 and P1 are done: wrk and wrk2 modes in one binary, the combined Lua API, autocannon/vegeta-style flags, and `--json` for [GATF](https://github.com/sumeetchhetri/gatf). P2 added native Windows builds (x64 and ARM64); P3 hardened the release pipeline. See the [roadmap](#roadmap).
 
 ## Why this exists
 
@@ -155,9 +155,20 @@ CLI `-m/--body/-H` set defaults. A `-s` script can still override them.
 
 Each `v*` tag publishes:
 
-- `wperfk_<version>_<os>_<arch>.tar.gz`, or `.zip` for Windows. `os` is `linux`, `darwin` or `windows`; `arch` is `amd64` or `arm64`. The binary, LICENSE, NOTICE and README sit at the archive root. Linux builds are fully static (musl); macOS builds link OpenSSL statically.
+- `wperfk_<version>_<os>_<arch>.tar.gz`, or `.zip` for Windows. `os` is `linux`, `darwin` or `windows`; `arch` is `amd64` or `arm64`. The binary, LICENSE, NOTICE and README sit at the archive root.
+- `wperfk_<version>_darwin_universal.tar.gz`: one macOS binary for both Intel and Apple Silicon.
+- `wperfk_<version>_freebsd_amd64.tar.gz` (tier 2): published when the FreeBSD build passes; it never blocks a release.
 - `wperfk_<version>_checksums.txt`, one `sha256  filename` line per archive (`sha256sum` format).
 - GitHub build-provenance attestations for every archive.
+
+| Platform | Linking | Runs on |
+|---|---|---|
+| Linux | fully static (musl) | any distro, glibc or musl |
+| macOS | OpenSSL 3.5 LTS built from source and linked statically | macOS 11 Big Sur and later |
+| Windows | fully static (MinGW, UCRT) | Windows 10 / Server 2016 and later; system DLLs only |
+| FreeBSD | fully static | FreeBSD 14 and later |
+
+Every binary is stripped, and each is smoke-tested before it is packaged. To dry-run the whole pipeline without publishing, run the `release` workflow manually from the Actions tab.
 
 ## Building from source
 
@@ -195,8 +206,8 @@ make STATIC=1 CC=x86_64-w64-mingw32-gcc-posix WITH_OPENSSL=/path/to/mingw/openss
 | P1a | Optional `-R` (closed loop without it), `-m`, `--body`, `--body-file`, `--json` with status-code breakdown, static-safe embedded Lua module, release workflow and asset naming | ✅ done |
 | P1b | `delay()`, `stats(p)`, monotonic clock, `-p`, `-n`, `--warmup`, `--bailout`, rate units, 100 ms stop latency | ✅ done |
 | P2 | Windows x64 and ARM64: wepoll backend, Winsock shims, Ctrl+C handling, CI and release | ✅ done |
-| P3 | Release hardening: macOS universal binary and older-macOS support, FreeBSD, stripped binaries | next |
-| P4 | Homebrew tap, Scoop bucket, winget | |
+| P3 | Release hardening: macOS 11+ builds (pinned OpenSSL from source), macOS universal binary, FreeBSD, stripped binaries, release dry run | ✅ done |
+| P4 | Homebrew tap, Scoop bucket, winget | next |
 | P5 | `--progress`, `--targets`, `--hist-out` + `merge`, `--expect-*`, mTLS/SNI/verify, `--resolve` | |
 | P6 | Unix sockets / named pipes, HAR converter, Prometheus exporter, llhttp to replace archived `http_parser` | |
 
