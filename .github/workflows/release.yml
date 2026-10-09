@@ -223,3 +223,46 @@ jobs:
           pre=""; case "$GITHUB_REF_NAME" in *-*) pre="--prerelease";; esac
           gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" --generate-notes $pre
+
+  # Stable tags only: refresh Formula/ (Homebrew) and bucket/ (Scoop) on main,
+  # and open a winget-pkgs PR when a WINGET_TOKEN secret is configured.
+  packages:
+    needs: release
+    if: ${{ github.event_name == 'push' && !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-24.04
+    env:
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Generate Homebrew, Scoop and winget definitions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --pattern "wperfk_${VERSION}_checksums.txt" --dir dist
+          tools/gen-packages.sh "$VERSION" dist
+          ruby -c Formula/wperfk.rb
+          python3 -m json.tool bucket/wperfk.json > /dev/null
+
+      - name: Commit to main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula bucket winget
+          git diff --cached --quiet && exit 0
+          git commit -m "packages: wperfk ${GITHUB_REF_NAME#v}"
+          git push origin HEAD:main
+
+      # winget-releaser only updates packages already in winget-pkgs: submit
+      # winget/*.yaml by hand once (see README), then this keeps it current.
+      - name: winget PR
+        if: env.WINGET_TOKEN != ''
+        uses: vedantmgoyal9/winget-releaser@v2
+        with:
+          identifier: SumeetChhetri.wperfk
+          installers-regex: '_windows_(amd64|arm64)\.zip$'
+          token: ${{ secrets.WINGET_TOKEN }}

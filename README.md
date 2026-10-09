@@ -113,6 +113,27 @@ This is our reading of the licences, not legal advice. If any upstream author se
 | Lua | LuaJIT 2.1 (pinned submodule) | same |
 | TLS | OpenSSL 3.x | same, static |
 
+## Install
+
+From the first stable release:
+
+```sh
+# macOS and Linux (Homebrew)
+brew tap sumeetchhetri/wperfk https://github.com/sumeetchhetri/wperfk
+brew install wperfk
+
+# Windows (Scoop)
+scoop bucket add wperfk https://github.com/sumeetchhetri/wperfk
+scoop install wperfk
+
+# Windows (winget), once the package is accepted into winget-pkgs
+winget install SumeetChhetri.wperfk
+```
+
+Or download an archive from [Releases](https://github.com/sumeetchhetri/wperfk/releases); every binary is a single static file.
+
+Maintainers: each stable tag regenerates `Formula/`, `bucket/` and `winget/` with `tools/gen-packages.sh` and commits them to `main`. For winget, submit `winget/*.yaml` to [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs) once by hand (under `manifests/s/SumeetChhetri/wperfk/<version>/`). After that, a `WINGET_TOKEN` repository secret (a classic PAT with `public_repo`) lets the release open the update PRs.
+
 ## Usage
 
 ```
@@ -207,8 +228,8 @@ make STATIC=1 CC=x86_64-w64-mingw32-gcc-posix WITH_OPENSSL=/path/to/mingw/openss
 | P1b | `delay()`, `stats(p)`, monotonic clock, `-p`, `-n`, `--warmup`, `--bailout`, rate units, 100 ms stop latency | ✅ done |
 | P2 | Windows x64 and ARM64: wepoll backend, Winsock shims, Ctrl+C handling, CI and release | ✅ done |
 | P3 | Release hardening: macOS 11+ builds (pinned OpenSSL from source), macOS universal binary, FreeBSD, stripped binaries, release dry run | ✅ done |
-| P4 | Homebrew tap, Scoop bucket, winget | next |
-| P5 | `--progress`, `--targets`, `--hist-out` + `merge`, `--expect-*`, mTLS/SNI/verify, `--resolve` | |
+| P4 | Homebrew tap, Scoop bucket, winget | ✅ done |
+| P5 | `--progress`, `--targets`, `--hist-out` + `merge`, `--expect-*`, mTLS/SNI/verify, `--resolve` | next |
 | P6 | Unix sockets / named pipes, HAR converter, Prometheus exporter, llhttp to replace archived `http_parser` | |
 
 ## Known limitations
