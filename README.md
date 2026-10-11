@@ -67,8 +67,8 @@ This is our reading of the licences, not legal advice. If any upstream author se
 | Live progress | `--progress` to stderr (stdout stays clean for JSON) | P5 |
 | mTLS and SNI | `--cert`, `--key`, `--cacert`, `--sni`, `--verify` | P5 |
 | Unix socket / Windows named pipe targets | `--unix-socket PATH` | P6 |
-| Request sequences with per-connection state (login → token) | Already possible with Lua `request()`/`response()`; shipped as example scripts | P1 |
-| Unique IDs in bodies | Example Lua script (no new flag) | P1 |
+| Request sequences with state (login → token) | Lua `request()`/`response()`; example `scripts/login-token.lua` | P5 |
+| Unique IDs in bodies | Example `scripts/unique-id.lua` (no new flag) | P5 |
 | HAR import | `wperfk har2targets` converter | P6 |
 
 ### From vegeta
@@ -154,8 +154,41 @@ wperfk -t2 -c10 -d10s -m POST --body-file req.json \
 | `-m, --method <M>` | HTTP method |
 | `--body <S>`, `--body-file <F>` | Request body (binary-safe from file) |
 | `--json` | JSON summary on stdout. All other output, including Lua `print`, goes to stderr |
+| `--progress <T>` | Live progress on stderr every T: requests, req/s, errors |
+| `--targets <F>` | Send requests from a target file round-robin (see below). The URL argument becomes optional |
+| `--status-codes` | Print the number of responses per status code |
+| `--expect-status <L>` | Allowed status codes, e.g. `200,204` or `2xx,304`. Others count as mismatches |
+| `--expect-body <S>` | Response body must contain S. Others count as mismatches |
+| `--hist-out <F>` | Save the latency histograms and totals, for `wperfk merge` |
+| `--verify` | Verify the server certificate and host name (off by default, as in wrk) |
+| `--cacert <F>` | CA bundle for `--verify`; implies `--verify` |
+| `--cert <F>`, `--key <F>` | Client certificate and key (PEM) for mutual TLS |
+| `--sni <S>` | TLS server name for SNI and verification (default: URL host) |
+| `--resolve <H:P:A>` | Connect to address A for host H port P, keeping H for Host, SNI and verification (curl syntax) |
 
 CLI `-m/--body/-H` set defaults. A `-s` script can still override them.
+
+**Exit codes:** 0 success, 1 usage or setup error, 2 `--bailout` reached, 3 `--expect-*` mismatches.
+
+**Targets file** (vegeta's HTTP format). Targets are separated by a blank line, lines starting with `#` are comments, and `@file` sets the body. All targets must share one scheme, host and port. `-H` headers and `--body` apply to every target unless it sets its own:
+
+```
+GET https://api.example.com/users
+Authorization: Bearer abc
+
+POST https://api.example.com/users
+Content-Type: application/json
+@user.json
+```
+
+**Distributed runs:** run wperfk on several machines with `--hist-out node1.hist` etc., then combine them. Percentiles are merged exactly from the histogram buckets, not averaged:
+
+```sh
+wperfk merge node1.hist node2.hist node3.hist          # text report
+wperfk merge --json node*.hist > combined.json
+```
+
+**TLS notes:** `--verify` without `--cacert` uses the system CA bundle on Linux, macOS and FreeBSD, and the Windows certificate store on Windows. With TLS 1.3, a server that rejects the client certificate does so after the handshake, so it shows up as read errors rather than connect errors.
 
 **`--json` output** (one object, latencies in µs):
 
@@ -164,13 +197,13 @@ CLI `-m/--body/-H` set defaults. A `-s` script can still override them.
  "threads":2,"connections":4,"duration_s":2,"runtime_us":2001234,
  "pipeline":1,"warmup_s":0,"requests_limit":0,"bailout":0,"stopped_by":"duration",
  "requests":202,"bytes":34436,"requests_per_sec":100.94,"bytes_per_sec":17207.8,
- "errors":{"total":0,"connect":0,"read":0,"write":0,"timeout":0,"status":0},
+ "errors":{"total":0,"connect":0,"read":0,"write":0,"timeout":0,"status":0,"mismatch":0},
  "status_codes":{"200":202},"latency_unit":"us",
  "latency":{"min":…,"max":…,"mean":…,"stdev":…,"p50":…,"p75":…,"p90":…,"p99":…,"p99_9":…,"p99_99":…,"p99_999":…},
  "latency_uncorrected":{…}}
 ```
 
-`stopped_by` is `duration`, `requests`, `bailout` or `signal`. `mode` is `closed` or `rate`. In `closed` mode, `latency` and `latency_uncorrected` are identical. `errors.status` counts responses ≥ 400.
+`stopped_by` is `duration`, `requests`, `bailout`, `signal`, or `merged` for `wperfk merge`. `mode` is `closed` or `rate`. In `closed` mode, `latency` and `latency_uncorrected` are identical. `errors.status` counts responses ≥ 400; `errors.mismatch` counts `--expect-*` failures.
 
 ## Release assets
 
@@ -229,8 +262,8 @@ make STATIC=1 CC=x86_64-w64-mingw32-gcc-posix WITH_OPENSSL=/path/to/mingw/openss
 | P2 | Windows x64 and ARM64: wepoll backend, Winsock shims, Ctrl+C handling, CI and release | ✅ done |
 | P3 | Release hardening: macOS 11+ builds (pinned OpenSSL from source), macOS universal binary, FreeBSD, stripped binaries, release dry run | ✅ done |
 | P4 | Homebrew tap, Scoop bucket, winget | ✅ done |
-| P5 | `--progress`, `--targets`, `--hist-out` + `merge`, `--expect-*`, mTLS/SNI/verify, `--resolve` | next |
-| P6 | Unix sockets / named pipes, HAR converter, Prometheus exporter, llhttp to replace archived `http_parser` | |
+| P5 | `--progress`, `--targets`, `--hist-out` + `merge`, `--expect-*`, `--status-codes`, mTLS/SNI/verify, `--resolve` | ✅ done |
+| P6 | Unix sockets / named pipes, HAR converter, Prometheus exporter, llhttp to replace archived `http_parser` | next |
 
 ## Known limitations
 

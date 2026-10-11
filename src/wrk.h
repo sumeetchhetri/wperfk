@@ -37,6 +37,18 @@
 #define OPT_JSON      258
 #define OPT_WARMUP    259
 #define OPT_BAILOUT   260
+#define OPT_PROGRESS  261
+#define OPT_TARGETS   262
+#define OPT_HIST_OUT  263
+#define OPT_EXPECT_STATUS 264
+#define OPT_EXPECT_BODY   265
+#define OPT_STATUS_CODES  266
+#define OPT_VERIFY    267
+#define OPT_CACERT    268
+#define OPT_CERT      269
+#define OPT_KEY       270
+#define OPT_SNI       271
+#define OPT_RESOLVE   272
 #define LIMITS_INTERVAL_MS 100
 
 typedef struct {

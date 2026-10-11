@@ -48,6 +48,20 @@ static int response_body(http_parser *, const char *, size_t);
 static uint64_t time_us();
 
 static int read_file(const char *, char **, size_t *);
+
+typedef struct {
+    uint64_t runtime_us, requests, bytes, rate, threads, connections;
+    errors errors;
+} hist_meta;
+
+static int merge_main(int, char **);
+static bool contains(const char *, size_t, const char *);
+static int parse_expect_status(char *, bool *);
+static char *targets_first_url(const char *);
+static int apply_resolve(char *, char *, char *, char *, char **, char **);
+static void progress_loop(thread *);
+static int write_hist(const char *, const char *, hist_meta *, uint64_t *,
+                      struct hdr_histogram *, struct hdr_histogram *);
 static int scan_rate(char *, uint64_t *);
 static void report_errors(thread *);
 static int check_limits(aeEventLoop *, long long, void *);

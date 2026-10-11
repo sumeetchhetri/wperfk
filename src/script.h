@@ -11,6 +11,7 @@
 
 lua_State *script_create(char *, char *, char **);
 void script_request_defaults(const char *, const char *, size_t, uint64_t);
+void script_targets(const char *);
 
 bool script_resolve(lua_State *, char *, char *);
 void script_setup(lua_State *, thread *);

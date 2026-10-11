@@ -33,6 +33,15 @@ static struct config {
     char    *host;
     char    *script;
     SSL_CTX *ctx;
+    uint64_t progress;
+    char    *targets;
+    char    *hist_out;
+    char    *expect_body;
+    bool     expect_status_set;
+    bool     expect_status[600];
+    bool     status_codes;
+    tls_opts tls;
+    char    *resolve;
 } cfg;
 
 static struct {
@@ -55,12 +64,13 @@ static struct http_parser_settings parser_settings = {
 static volatile sig_atomic_t stop = 0;
 
 // Run-level stop reasons and shared counters (updated atomically by threads).
-enum { STOP_DURATION, STOP_REQUESTS, STOP_BAILOUT, STOP_SIGNAL };
-static const char *stop_names[] = { "duration", "requests", "bailout", "signal" };
+enum { STOP_DURATION, STOP_REQUESTS, STOP_BAILOUT, STOP_SIGNAL, STOP_MERGED };
+static const char *stop_names[] = { "duration", "requests", "bailout", "signal", "merged" };
 static volatile int stopped_by = STOP_DURATION;
 static uint64_t responses_total = 0;
 static uint64_t errors_total    = 0;
 static uint64_t warmup_end      = 0;
+static int      threads_running = 0;
 
 static void handler(int sig) {
     stopped_by = STOP_SIGNAL;
@@ -95,6 +105,21 @@ static void usage() {
            "        --body-file   <F>  Request body from file                   \n"
            "        --json             Print JSON summary on stdout; all other   \n"
            "                           output (incl. Lua print) goes to stderr  \n"
+           "        --progress    <T>  Print live progress to stderr every T    \n"
+           "        --targets     <F>  Request targets file (vegeta HTTP format),\n"
+           "                           sent round-robin; URL may be omitted     \n"
+           "        --status-codes     Print responses per status code          \n"
+           "        --expect-status <L> Allowed codes, e.g. 200,204 or 2xx       \n"
+           "        --expect-body <S>  Response body must contain S             \n"
+           "                           (mismatches count as errors; exit 3)     \n"
+           "        --hist-out    <F>  Save latency histograms for `wperfk merge`\n"
+           "        --verify           Verify the server's TLS certificate      \n"
+           "        --cacert      <F>  CA bundle for --verify (implies it)      \n"
+           "        --cert/--key  <F>  Client certificate and key (mTLS, PEM)   \n"
+           "        --sni         <S>  TLS server name (default: URL host)      \n"
+           "        --resolve <H:P:A>  Connect to address A for host H port P   \n"
+           "                                                      \n"
+           "  wperfk merge [--json] <hist files...>  Combine --hist-out results \n"
            "                                                      \n"
            "  Numeric arguments may include a SI unit (1k, 1M, 1G)\n"
            "  Time arguments may include a time unit (2s, 2m, 2h)\n");
@@ -103,6 +128,10 @@ static void usage() {
 int main(int argc, char **argv) {
     char *url, **headers = zmalloc(argc * sizeof(char *));
     struct http_parser_url parts = {};
+
+    if (argc > 1 && !strcmp(argv[1], "merge")) {
+        return merge_main(argc - 1, argv + 1);
+    }
 
     if (parse_args(&cfg, &url, &parts, headers, argc, argv)) {
         usage();
@@ -122,6 +151,7 @@ int main(int argc, char **argv) {
     }
 
     script_request_defaults(cfg.method, cfg.body, cfg.body_len, cfg.pipeline);
+    script_targets(cfg.targets);
 
     char *schema  = copy_url_part(url, &parts, UF_SCHEMA);
     char *host    = copy_url_part(url, &parts, UF_HOST);
@@ -129,7 +159,7 @@ int main(int argc, char **argv) {
     char *service = port ? port : schema;
 
     if (!strncmp("https", schema, 5)) {
-        if ((cfg.ctx = ssl_init()) == NULL) {
+        if ((cfg.ctx = ssl_init(&cfg.tls)) == NULL) {
             fprintf(stderr, "unable to initialize SSL\n");
             ERR_print_errors_fp(stderr);
             exit(1);
@@ -141,7 +171,12 @@ int main(int argc, char **argv) {
         sock.readable = ssl_readable;
     }
 	
-    cfg.host = host;
+    cfg.host = cfg.tls.sni ? (char *) cfg.tls.sni : host;
+
+    char *connect_host = host, *connect_service = service;
+    if (cfg.resolve && apply_resolve(cfg.resolve, host, service, schema, &connect_host, &connect_service)) {
+        exit(1);
+    }
 	
 #ifdef SIGPIPE
     signal(SIGPIPE, SIG_IGN);
@@ -156,9 +191,9 @@ int main(int argc, char **argv) {
 
 
     lua_State *L = script_create(cfg.script, url, headers);
-    if (!script_resolve(L, host, service)) {
+    if (!script_resolve(L, connect_host, connect_service)) {
         char *msg = strerror(errno);
-        fprintf(stderr, "unable to connect to %s:%s %s\n", host, service, msg);
+        fprintf(stderr, "unable to connect to %s:%s %s\n", connect_host, connect_service, msg);
         exit(1);
     }
     
@@ -197,8 +232,12 @@ int main(int argc, char **argv) {
                 parser_settings.on_header_value = header_value;
                 parser_settings.on_body         = response_body;
             }
+            if (cfg.expect_body) {
+                parser_settings.on_body = response_body;
+            }
         }
 
+        __sync_add_and_fetch(&threads_running, 1);
         if (!t->loop || pthread_create(&t->thread, NULL, &thread_main, t)) {
             char *msg = strerror(errno);
             fprintf(stderr, "unable to create thread %"PRIu64": %s\n", i, msg);
@@ -248,6 +287,10 @@ int main(int argc, char **argv) {
     struct hdr_histogram* u_latency_histogram;
     hdr_init(1, MAX_LATENCY, 3, &u_latency_histogram);
 
+    if (cfg.progress) {
+        progress_loop(threads);
+    }
+
     for (uint64_t i = 0; i < cfg.threads; i++) {
         thread *t = &threads[i];
         pthread_join(t->thread, NULL);
@@ -265,6 +308,7 @@ int main(int argc, char **argv) {
         errors.write   += t->errors.write;
         errors.timeout += t->errors.timeout;
         errors.status  += t->errors.status;
+        errors.mismatch += t->errors.mismatch;
         for (int s = 0; s < 600; s++) status_codes[s] += t->status_codes[s];
 
         hdr_add(latency_histogram, t->latency_histogram);
@@ -314,6 +358,16 @@ int main(int argc, char **argv) {
     if (errors.status) {
         printf("  Non-2xx or 3xx responses: %d\n", errors.status);
     }
+    if (errors.mismatch) {
+        printf("  Unexpected responses (--expect-*): %d\n", errors.mismatch);
+    }
+    if (cfg.status_codes) {
+        printf("  Status codes:");
+        for (int s = 0; s < 600; s++) {
+            if (status_codes[s]) printf(" %d=%"PRIu64, s, status_codes[s]);
+        }
+        printf("\n");
+    }
 
     printf("Requests/sec: %9.2Lf\n", req_per_s);
     printf("Transfer/sec: %10sB\n", format_binary(bytes_per_s));
@@ -330,10 +384,25 @@ int main(int argc, char **argv) {
         fclose(json_out);
     }
 
+    if (cfg.hist_out) {
+        hist_meta m = {
+            .runtime_us = runtime_us, .requests = complete, .bytes = bytes,
+            .rate = cfg.rate, .threads = cfg.threads, .connections = cfg.connections,
+            .errors = errors,
+        };
+        if (write_hist(cfg.hist_out, url, &m, status_codes, latency_histogram, u_latency_histogram)) {
+            fprintf(stderr, "unable to write %s: %s\n", cfg.hist_out, strerror(errno));
+            return 1;
+        }
+    }
+
     if (stopped_by == STOP_BAILOUT) {
         fflush(stdout);
         fprintf(stderr, "Bailed out after %"PRIu64" errors\n", errors_total);
         return 2;
+    }
+    if (errors.mismatch) {
+        return 3;
     }
     return 0;
 }
@@ -396,6 +465,7 @@ void *thread_main(void *arg) {
     aeDeleteEventLoop(loop);
     zfree(thread->cs);
 
+    __sync_sub_and_fetch(&threads_running, 1);
     return NULL;
 }
 
@@ -474,7 +544,7 @@ static int calibrate(aeEventLoop *loop, long long id, void *data) {
 
 static void report_errors(thread *thread) {
     errors *e = &thread->errors;
-    uint64_t sum = (uint64_t) e->connect + e->read + e->write + e->timeout + e->status;
+    uint64_t sum = (uint64_t) e->connect + e->read + e->write + e->timeout + e->status + e->mismatch;
     if (sum > thread->errors_reported) {
         uint64_t total = __sync_add_and_fetch(&errors_total, sum - thread->errors_reported);
         thread->errors_reported = sum;
@@ -660,10 +730,18 @@ static int response_complete(http_parser *parser) {
         thread->status_codes[status]++;
     }
 
+    if ((cfg.expect_status_set && (status <= 0 || status >= 600 || !cfg.expect_status[status])) ||
+        (cfg.expect_body && !contains(c->body.buffer, c->body.cursor - c->body.buffer, cfg.expect_body))) {
+        thread->errors.mismatch++;
+        if (cfg.bailout) report_errors(thread);
+    }
+
     if (c->headers.buffer) {
         *c->headers.cursor++ = '\0';
         script_response(thread->L, status, &c->headers, &c->body);
         c->state = FIELD;
+    } else if (cfg.expect_body) {
+        buffer_reset(&c->body);
     }
 
     if (now >= thread->stop_at) {
@@ -904,6 +982,18 @@ static struct option longopts[] = {
     { "requests",       required_argument, NULL, 'n' },
     { "warmup",         required_argument, NULL, OPT_WARMUP },
     { "bailout",        required_argument, NULL, OPT_BAILOUT },
+    { "progress",       required_argument, NULL, OPT_PROGRESS },
+    { "targets",        required_argument, NULL, OPT_TARGETS },
+    { "hist-out",       required_argument, NULL, OPT_HIST_OUT },
+    { "expect-status",  required_argument, NULL, OPT_EXPECT_STATUS },
+    { "expect-body",    required_argument, NULL, OPT_EXPECT_BODY },
+    { "status-codes",   no_argument,       NULL, OPT_STATUS_CODES },
+    { "verify",         no_argument,       NULL, OPT_VERIFY },
+    { "cacert",         required_argument, NULL, OPT_CACERT },
+    { "cert",           required_argument, NULL, OPT_CERT },
+    { "key",            required_argument, NULL, OPT_KEY },
+    { "sni",            required_argument, NULL, OPT_SNI },
+    { "resolve",        required_argument, NULL, OPT_RESOLVE },
     { NULL,             0,                 NULL,  0  }
 };
 
@@ -970,6 +1060,47 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
             case OPT_BAILOUT:
                 if (scan_metric(optarg, &cfg->bailout) || !cfg->bailout) return -1;
                 break;
+            case OPT_PROGRESS:
+                if (scan_time(optarg, &cfg->progress) || !cfg->progress) return -1;
+                break;
+            case OPT_TARGETS:
+                cfg->targets = optarg;
+                break;
+            case OPT_HIST_OUT:
+                cfg->hist_out = optarg;
+                break;
+            case OPT_EXPECT_STATUS:
+                if (parse_expect_status(optarg, cfg->expect_status)) {
+                    fprintf(stderr, "invalid --expect-status %s (use e.g. 200,204 or 2xx)\n", optarg);
+                    return -1;
+                }
+                cfg->expect_status_set = true;
+                break;
+            case OPT_EXPECT_BODY:
+                cfg->expect_body = optarg;
+                break;
+            case OPT_STATUS_CODES:
+                cfg->status_codes = true;
+                break;
+            case OPT_VERIFY:
+                cfg->tls.verify = true;
+                break;
+            case OPT_CACERT:
+                cfg->tls.cacert = optarg;
+                cfg->tls.verify = true;
+                break;
+            case OPT_CERT:
+                cfg->tls.cert = optarg;
+                break;
+            case OPT_KEY:
+                cfg->tls.key = optarg;
+                break;
+            case OPT_SNI:
+                cfg->tls.sni = optarg;
+                break;
+            case OPT_RESOLVE:
+                cfg->resolve = optarg;
+                break;
             case 'm':
                 cfg->method = optarg;
                 break;
@@ -1001,10 +1132,15 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
 
     if (version && optind == argc) exit(0); // plain `wperfk -v`
 
-    if (optind == argc || !cfg->threads || !cfg->duration) return -1;
+    char *target_url = argv[optind];
+    if (optind == argc && cfg->targets) {
+        if (!(target_url = targets_first_url(cfg->targets))) return -1;
+    }
 
-    if (!script_parse_url(argv[optind], parts)) {
-        fprintf(stderr, "invalid URL: %s\n", argv[optind]);
+    if (!target_url || !cfg->threads || !cfg->duration) return -1;
+
+    if (!script_parse_url(target_url, parts)) {
+        fprintf(stderr, "invalid URL: %s\n", target_url);
         return -1;
     }
 
@@ -1013,7 +1149,7 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
         return -1;
     }
 
-    *url    = argv[optind];
+    *url    = target_url;
     *header = NULL;
 
     return 0;
@@ -1146,7 +1282,7 @@ static void print_json(FILE *out, char *url, uint64_t runtime_us, uint64_t compl
                        uint64_t bytes, errors *e, struct hdr_histogram *latency,
                        struct hdr_histogram *u_latency, uint64_t *status_codes) {
     double runtime_s = runtime_us / 1000000.0;
-    uint64_t total_errors = (uint64_t) e->connect + e->read + e->write + e->timeout + e->status;
+    uint64_t total_errors = (uint64_t) e->connect + e->read + e->write + e->timeout + e->status + e->mismatch;
 
     fprintf(out, "{\"tool\":\"wperfk\",\"version\":");
     json_string(out, VERSION);
@@ -1164,8 +1300,8 @@ static void print_json(FILE *out, char *url, uint64_t runtime_us, uint64_t compl
             runtime_us, complete, bytes,
             runtime_s > 0 ? complete / runtime_s : 0.0, runtime_s > 0 ? bytes / runtime_s : 0.0);
     fprintf(out, ",\"errors\":{\"total\":%"PRIu64",\"connect\":%u,\"read\":%u,\"write\":%u"
-                 ",\"timeout\":%u,\"status\":%u}",
-            total_errors, e->connect, e->read, e->write, e->timeout, e->status);
+                 ",\"timeout\":%u,\"status\":%u,\"mismatch\":%u}",
+            total_errors, e->connect, e->read, e->write, e->timeout, e->status, e->mismatch);
     fprintf(out, ",\"status_codes\":{");
     for (int s = 0, first = 1; s < 600; s++) {
         if (!status_codes[s]) continue;
@@ -1177,4 +1313,279 @@ static void print_json(FILE *out, char *url, uint64_t runtime_us, uint64_t compl
     fputc(',', out);
     json_latency(out, "latency_uncorrected", u_latency);
     fprintf(out, "}\n");
+}
+
+// ---------------------------------------------------------------------------
+// P5 helpers: expectations, targets, --resolve, progress, histogram files.
+
+static bool contains(const char *hay, size_t len, const char *needle) {
+    size_t n = strlen(needle);
+    if (n == 0) return true;
+    if (!hay || len < n) return false;
+    for (size_t i = 0; i + n <= len; i++) {
+        if (hay[i] == needle[0] && !memcmp(hay + i, needle, n)) return true;
+    }
+    return false;
+}
+
+// "200,204", "2xx", "2xx,304"
+static int parse_expect_status(char *spec, bool *allowed) {
+    char *copy = strdup(spec), *save = NULL;
+    int rc = 0;
+    for (char *tok = strtok_r(copy, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        if (strlen(tok) == 3 && isdigit((unsigned char) tok[0]) &&
+            tolower((unsigned char) tok[1]) == 'x' && tolower((unsigned char) tok[2]) == 'x') {
+            int base = (tok[0] - '0') * 100;
+            if (base < 100 || base > 500) { rc = -1; break; }
+            for (int s = base; s < base + 100; s++) allowed[s] = true;
+        } else {
+            char *end;
+            long s = strtol(tok, &end, 10);
+            if (*end || s < 100 || s > 599) { rc = -1; break; }
+            allowed[s] = true;
+        }
+    }
+    free(copy);
+    return rc;
+}
+
+// URL of the first target, used when no URL argument is given.
+static char *targets_first_url(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "unable to read targets %s: %s\n", path, strerror(errno));
+        return NULL;
+    }
+    char line[8192], method[32], url[8192 - 32];
+    char *found = NULL;
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        while (isspace((unsigned char) *p)) p++;
+        if (!*p || *p == '#') continue;
+        if (sscanf(p, "%31s %8159s", method, url) == 2) found = strdup(url);
+        break;
+    }
+    fclose(f);
+    if (!found) fprintf(stderr, "%s: no target found (expected 'METHOD URL')\n", path);
+    return found;
+}
+
+// curl-style HOST:PORT:ADDR. Returns 1 on a malformed spec.
+static int apply_resolve(char *spec, char *host, char *service, char *schema,
+                         char **chost, char **cservice) {
+    char *s = strdup(spec);
+    char *port = strchr(s, ':');
+    char *addr = port ? strchr(port + 1, ':') : NULL;
+    if (!port || !addr || !addr[1]) {
+        fprintf(stderr, "invalid --resolve %s (expected HOST:PORT:ADDRESS)\n", spec);
+        return 1;
+    }
+    *port++ = '\0';
+    *addr++ = '\0';
+    size_t alen = strlen(addr);
+    if (addr[0] == '[' && addr[alen - 1] == ']') {
+        addr[alen - 1] = '\0';
+        addr++;
+    }
+    const char *want = isdigit((unsigned char) service[0]) ? service
+                     : (!strncmp(schema, "https", 5) ? "443" : "80");
+    if (strcasecmp(s, host) || strcmp(port, want)) {
+        fprintf(stderr, "warning: --resolve %s ignored, target is %s:%s\n", spec, host, want);
+        return 0;
+    }
+    *chost    = addr;
+    *cservice = port;
+    return 0;
+}
+
+static void sleep_ms(int ms) {
+#ifdef _WIN32
+    Sleep(ms);
+#else
+    struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L };
+    nanosleep(&ts, NULL);
+#endif
+}
+
+// Live progress on stderr. Counters are read without locks: approximate by design.
+static void progress_loop(thread *threads) {
+    uint64_t interval = cfg.progress * 1000000;
+    uint64_t last_t = time_us(), next = last_t + interval, last_req = 0;
+
+    while (__sync_add_and_fetch(&threads_running, 0) > 0) {
+        sleep_ms(50);
+        uint64_t now = time_us();
+        if (now < next) continue;
+        next += interval;
+
+        uint64_t req = 0, err = 0;
+        for (uint64_t i = 0; i < cfg.threads; i++) {
+            errors *e = &threads[i].errors;
+            req += threads[i].complete;
+            err += (uint64_t) e->connect + e->read + e->write + e->timeout + e->status + e->mismatch;
+        }
+        if (req < last_req) last_req = 0; // counters reset when warmup ended
+
+        bool warming = now < warmup_end;
+        double elapsed = warming ? cfg.warmup - (warmup_end - now) / 1e6 : (now - warmup_end) / 1e6;
+        fprintf(stderr, "  [%s %7.1fs] %"PRIu64" requests, %.0f req/s, %"PRIu64" errors\n",
+                warming ? "warmup" : "run", elapsed, req,
+                (req - last_req) / ((now - last_t) / 1e6), err);
+        last_req = req;
+        last_t   = now;
+    }
+}
+
+// Histogram file: exact bucket counts plus run totals, mergeable across machines.
+static void write_hist_counts(FILE *f, const char *name, struct hdr_histogram *h) {
+    fprintf(f, "hist %s %"PRId64" %"PRId64" %"PRId64" %d\n", name,
+            h->lowest_trackable_value, h->highest_trackable_value,
+            h->significant_figures, h->counts_len);
+    for (int i = 0; i < h->counts_len; i++) {
+        if (h->counts[i]) fprintf(f, "%d %"PRId64"\n", i, h->counts[i]);
+    }
+    fprintf(f, "end\n");
+}
+
+static int write_hist(const char *path, const char *url, hist_meta *m, uint64_t *codes,
+                      struct hdr_histogram *latency, struct hdr_histogram *u_latency) {
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+    errors *e = &m->errors;
+    fprintf(f, "wperfk-hist 1\nurl %s\nrate %"PRIu64"\nthreads %"PRIu64"\nconnections %"PRIu64"\n"
+               "runtime_us %"PRIu64"\nrequests %"PRIu64"\nbytes %"PRIu64"\n"
+               "errors %u %u %u %u %u %u\n",
+            url, m->rate, m->threads, m->connections, m->runtime_us, m->requests, m->bytes,
+            e->connect, e->read, e->write, e->timeout, e->status, e->mismatch);
+    for (int s = 0; s < 600; s++) {
+        if (codes[s]) fprintf(f, "status %d %"PRIu64"\n", s, codes[s]);
+    }
+    write_hist_counts(f, "latency", latency);
+    write_hist_counts(f, "u_latency", u_latency);
+    return fclose(f);
+}
+
+static int read_hist_counts(FILE *f, const char *path, char *line, struct hdr_histogram *h) {
+    char name[32];
+    int64_t lo, hi, sig;
+    int len;
+    if (sscanf(line, "hist %31s %"SCNd64" %"SCNd64" %"SCNd64" %d", name, &lo, &hi, &sig, &len) != 5 ||
+        lo != h->lowest_trackable_value || hi != h->highest_trackable_value ||
+        sig != h->significant_figures || len != h->counts_len) {
+        fprintf(stderr, "%s: incompatible histogram (%s)\n", path, name);
+        return -1;
+    }
+    char buf[128];
+    while (fgets(buf, sizeof(buf), f) && strncmp(buf, "end", 3)) {
+        int idx;
+        int64_t count;
+        if (sscanf(buf, "%d %"SCNd64, &idx, &count) != 2 || idx < 0 || idx >= len || count < 0) {
+            fprintf(stderr, "%s: bad histogram line: %s", path, buf);
+            return -1;
+        }
+        h->counts[idx]  += count;
+        h->total_count  += count;
+    }
+    return 0;
+}
+
+// wperfk merge [--json] <files...>
+static int merge_main(int argc, char **argv) {
+    bool json = false;
+    int first = 1;
+    if (argc > 1 && !strcmp(argv[1], "--json")) { json = true; first = 2; }
+    if (first >= argc) {
+        fprintf(stderr, "Usage: wperfk merge [--json] <hist files from --hist-out...>\n");
+        return 1;
+    }
+
+    struct hdr_histogram *latency, *u_latency;
+    hdr_init(1, MAX_LATENCY, 3, &latency);
+    hdr_init(1, MAX_LATENCY, 3, &u_latency);
+    hist_meta total = { 0 };
+    uint64_t codes[600] = { 0 };
+    char url[4096] = "", line[4096];
+
+    for (int i = first; i < argc; i++) {
+        FILE *f = fopen(argv[i], "r");
+        if (!f) {
+            fprintf(stderr, "unable to read %s: %s\n", argv[i], strerror(errno));
+            return 1;
+        }
+        if (!fgets(line, sizeof(line), f) || strncmp(line, "wperfk-hist 1", 13)) {
+            fprintf(stderr, "%s: not a wperfk --hist-out file\n", argv[i]);
+            return 1;
+        }
+        hist_meta m = { 0 };
+        errors *e = &m.errors;
+        char u[4096];
+        int code, rc = 0;
+        uint64_t count;
+        while (!rc && fgets(line, sizeof(line), f)) {
+            if      (sscanf(line, "url %4095s", u) == 1) {
+                if (!url[0]) strcpy(url, u);
+                else if (strcmp(url, u)) strcpy(url, "(multiple)");
+            }
+            else if (sscanf(line, "rate %"SCNu64, &m.rate) == 1) ;
+            else if (sscanf(line, "threads %"SCNu64, &m.threads) == 1) ;
+            else if (sscanf(line, "connections %"SCNu64, &m.connections) == 1) ;
+            else if (sscanf(line, "runtime_us %"SCNu64, &m.runtime_us) == 1) ;
+            else if (sscanf(line, "requests %"SCNu64, &m.requests) == 1) ;
+            else if (sscanf(line, "bytes %"SCNu64, &m.bytes) == 1) ;
+            else if (sscanf(line, "errors %u %u %u %u %u %u", &e->connect, &e->read, &e->write,
+                            &e->timeout, &e->status, &e->mismatch) == 6) ;
+            else if (sscanf(line, "status %d %"SCNu64, &code, &count) == 2 && code > 0 && code < 600)
+                codes[code] += count;
+            else if (!strncmp(line, "hist latency ", 13))
+                rc = read_hist_counts(f, argv[i], line, latency);
+            else if (!strncmp(line, "hist u_latency ", 15))
+                rc = read_hist_counts(f, argv[i], line, u_latency);
+        }
+        fclose(f);
+        if (rc) return 1;
+
+        total.rate        += m.rate;
+        total.threads     += m.threads;
+        total.connections += m.connections;
+        total.requests    += m.requests;
+        total.bytes       += m.bytes;
+        total.runtime_us   = MAX(total.runtime_us, m.runtime_us); // runs are concurrent
+        total.errors.connect  += e->connect;
+        total.errors.read     += e->read;
+        total.errors.write    += e->write;
+        total.errors.timeout  += e->timeout;
+        total.errors.status   += e->status;
+        total.errors.mismatch += e->mismatch;
+    }
+
+    FILE *out = stdout;
+    if (json) {
+        cfg.rate = total.rate;
+        cfg.threads = total.threads;
+        cfg.connections = total.connections;
+        cfg.duration = total.runtime_us / 1000000;
+        cfg.duration_set = true;
+        stopped_by = STOP_MERGED;
+        print_json(out, url, total.runtime_us, total.requests, total.bytes, &total.errors,
+                   latency, u_latency, codes);
+        return 0;
+    }
+
+    double runtime_s = total.runtime_us / 1e6;
+    printf("Merged %d results for %s\n", argc - first, url);
+    printf("  %"PRIu64" threads and %"PRIu64" connections in total\n", total.threads, total.connections);
+    print_hdr_latency(latency, "Recorded Latency");
+    printf("----------------------------------------------------------\n");
+    printf("  %"PRIu64" requests in %s, %sB read\n", total.requests,
+           format_time_us(total.runtime_us), format_binary(total.bytes));
+    errors *e = &total.errors;
+    if (e->connect || e->read || e->write || e->timeout) {
+        printf("  Socket errors: connect %u, read %u, write %u, timeout %u\n",
+               e->connect, e->read, e->write, e->timeout);
+    }
+    if (e->status)   printf("  Non-2xx or 3xx responses: %u\n", e->status);
+    if (e->mismatch) printf("  Unexpected responses (--expect-*): %u\n", e->mismatch);
+    printf("Requests/sec: %9.2f\n", runtime_s > 0 ? total.requests / runtime_s : 0.0);
+    printf("Transfer/sec: %10sB\n", format_binary(runtime_s > 0 ? total.bytes / runtime_s : 0));
+    return 0;
 }

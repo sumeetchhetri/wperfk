@@ -16,7 +16,12 @@ static struct {
     const char *body;
     size_t      body_len;
     uint64_t    pipeline;
+    const char *targets;
 } request_defaults;
+
+void script_targets(const char *path) {
+    request_defaults.targets = path;
+}
 
 void script_request_defaults(const char *method, const char *body, size_t body_len, uint64_t pipeline) {
     request_defaults.method   = method;
@@ -135,6 +140,10 @@ lua_State *script_create(char *file, char *url, char **headers) {
     if (request_defaults.pipeline > 1) {
         lua_pushnumber(L, (lua_Number) request_defaults.pipeline);
         lua_setfield(L, 4, "pipeline");
+    }
+    if (request_defaults.targets) {
+        lua_pushstring(L, request_defaults.targets);
+        lua_setfield(L, 4, "targets_file");
     }
     lua_pop(L, 4);
 
@@ -274,7 +283,8 @@ void script_errors(lua_State *L, errors *errors) {
         errors->read,
         errors->write,
         errors->status,
-        errors->timeout
+        errors->timeout,
+        errors->mismatch
     };
     const table_field fields[] = {
         { "connect", LUA_TNUMBER, &e[0] },
@@ -282,6 +292,7 @@ void script_errors(lua_State *L, errors *errors) {
         { "write",   LUA_TNUMBER, &e[2] },
         { "status",  LUA_TNUMBER, &e[3] },
         { "timeout", LUA_TNUMBER, &e[4] },
+        { "mismatch", LUA_TNUMBER, &e[5] },
         { NULL,      0,           NULL  },
     };
     lua_newtable(L);

@@ -10,8 +10,12 @@ tmp=$(mktemp -d)
 MSYS2_ARG_CONV_EXCL='/CN=' openssl req -x509 -newkey rsa:2048 -nodes -keyout "$tmp/k.pem" -out "$tmp/c.pem" \
   -days 1 -subj /CN=localhost >/dev/null 2>&1
 $PY tests/server.py $HTTP </dev/null >/dev/null 2>&1 & p1=$!
+MSYS2_ARG_CONV_EXCL='/CN=' openssl req -x509 -newkey rsa:2048 -nodes -keyout "$tmp/ck.pem" -out "$tmp/cc.pem" \
+  -days 1 -subj /CN=wperfk-client >/dev/null 2>&1
 $PY tests/server.py $HTTPS "$tmp/c.pem" "$tmp/k.pem" </dev/null >/dev/null 2>&1 & p2=$!
-trap 'kill $p1 $p2 2>/dev/null; rm -rf "$tmp"' EXIT
+MTLS=18444   # requires a client certificate
+$PY tests/server.py $MTLS "$tmp/c.pem" "$tmp/k.pem" "$tmp/cc.pem" </dev/null >/dev/null 2>&1 & p3=$!
+trap 'kill $p1 $p2 $p3 2>/dev/null; rm -rf "$tmp"' EXIT
 sleep 2
 
 fail=0
@@ -80,4 +84,41 @@ expect warmup           "80<=d['requests']<=120 and d['runtime_us']<2500000"    
 expect bailout          "d['stopped_by']=='bailout' and d['errors']['total']==5 and rc==2" -t2 -c4 -d30s --bailout 5 http://127.0.0.1:$HTTP/expect-post
 expect stats-call       "open(sys.argv[1]).read() and True"                            -t1 -c2 -d1s -s "$tmp/stats.lua" $B
 grep -q STATS_OK "$tmp/err" || { echo "FAIL stats-call (assert)"; cat "$tmp/err"; fail=1; }
+
+# P5: targets, expectations, histograms + merge, progress, TLS options, --resolve
+native() { command -v cygpath >/dev/null && cygpath -m "$1" || echo "$1"; }  # MSYS2: file contents aren't path-converted
+hits() { $PY -c "import json,urllib.request as u;print(json.dumps(json.load(u.urlopen('http://127.0.0.1:$HTTP/__hits'))))"; }
+printf 'hello-wperfk' > "$tmp/tbody"
+cat > "$tmp/targets.txt" <<EOF
+# two targets, sent round-robin
+GET http://127.0.0.1:$HTTP/t-get
+
+POST http://127.0.0.1:$HTTP/expect-post
+X-Test: 1
+@$(native "$tmp/tbody")
+EOF
+$PY -c "import urllib.request as u;u.urlopen('http://127.0.0.1:$HTTP/__reset')"
+expect targets          "d['requests']>0 and set(d['status_codes'])=={'200'}" -t1 -c2 -d1s --targets "$tmp/targets.txt"
+if hits | $PY -c "import json,sys; h=json.load(sys.stdin); a,b=h.get('GET /t-get',0),h.get('POST /expect-post',0); sys.exit(0 if a>0 and b>0 and abs(a-b)<=4 else 1)"
+then echo "ok   targets-round-robin"; else echo "FAIL targets-round-robin"; hits; fail=1; fi
+expect expect-status    "rc==3 and d['errors']['mismatch']==d['requests']>0"    -t1 -c2 -d1s --expect-status 204 $B
+expect expect-body      "rc==0 and d['errors']['mismatch']==0 and d['requests']>0" -t1 -c2 -d1s --expect-body token --expect-status 2xx $B
+expect hist-a           "d['requests']>0" -t1 -c2 -d1s --hist-out "$tmp/a.hist" $B
+cp "$tmp/out.json" "$tmp/a.json"
+expect hist-b           "d['requests']>0" -t1 -c2 -d1s --hist-out "$tmp/b.hist" $B
+"$BIN" merge --json "$tmp/a.hist" "$tmp/b.hist" > "$tmp/m.json" 2>"$tmp/err"
+if $PY - "$tmp/a.json" "$tmp/out.json" "$tmp/m.json" <<'PYEOF2'
+import json, sys
+a, b, m = (json.load(open(f)) for f in sys.argv[1:])
+assert m['requests'] == a['requests'] + b['requests'] and m['stopped_by'] == 'merged'
+assert m['latency']['max'] == max(a['latency']['max'], b['latency']['max'])
+PYEOF2
+then echo "ok   merge"; else echo "FAIL merge"; cat "$tmp/m.json" "$tmp/err"; fail=1; fi
+if "$BIN" -t1 -c2 -d2s --progress 1s $B 2>&1 | grep -q "\[run"; then echo "ok   progress"; else echo "FAIL progress"; fail=1; fi
+expect tls-verify-fail  "d['requests']==0 and d['errors']['connect']>0" -t1 -c2 -d1s --verify https://localhost:$HTTPS/
+expect tls-cacert       "d['requests']>0 and d['errors']['total']==0"   -t1 -c2 -d1s --cacert "$tmp/c.pem" https://localhost:$HTTPS/
+expect tls-sni          "d['requests']>0 and d['errors']['total']==0"   -t1 -c2 -d1s --cacert "$tmp/c.pem" --sni localhost https://127.0.0.1:$HTTPS/
+expect mtls-no-cert     "d['requests']==0"                              -t1 -c2 -d1s https://localhost:$MTLS/
+expect mtls-cert        "d['requests']>0 and d['errors']['total']==0"   -t1 -c2 -d1s --cert "$tmp/cc.pem" --key "$tmp/ck.pem" https://localhost:$MTLS/
+expect resolve          "d['requests']>0 and d['errors']['total']==0"   -t1 -c2 -d1s --resolve wperfk.invalid:$HTTP:127.0.0.1 http://wperfk.invalid:$HTTP/
 exit $fail
