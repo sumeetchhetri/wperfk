@@ -267,7 +267,10 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+      # Windows only: elsewhere use the runner's python3, as the build smoke tests
+      # do (setup-python's server was unreachable on loopback on macos-15 arm64).
       - uses: actions/setup-python@v5
+        if: runner.os == 'Windows'
         with:
           python-version: '3.12'
       - uses: actions/download-artifact@v4

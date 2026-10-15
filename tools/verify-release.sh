@@ -58,15 +58,22 @@ esac
 ok "platform checks"
 
 port=$((20000 + RANDOM % 20000))
-"$PY" "$src/tests/server.py" "$port" & srv=$!
+"$PY" "$src/tests/server.py" "$port" </dev/null > srv.log 2>&1 & srv=$!
 trap 'kill $srv 2>/dev/null || true' EXIT
-"$PY" - "$port" <<'PY' || fail "test server did not start"
+if ! "$PY" - "$port" <<'PY'; then
 import socket, sys, time
-for _ in range(100):
-    try: socket.create_connection(('127.0.0.1', int(sys.argv[1])), 0.2).close(); sys.exit(0)
-    except OSError: time.sleep(0.1)
+for _ in range(60):
+    try: socket.create_connection(('127.0.0.1', int(sys.argv[1])), 1).close(); sys.exit(0)
+    except OSError as e: err = e; time.sleep(0.25)
+print('last connect error:', err)
 sys.exit(1)
 PY
+  echo "python: $("$PY" -c 'import sys;print(sys.executable, sys.version)')"
+  kill -0 $srv 2>/dev/null && echo "server pid $srv alive" || echo "server exited"
+  cat srv.log
+  command -v lsof >/dev/null && lsof -nP -iTCP:"$port" || true
+  fail "test server on 127.0.0.1:$port not reachable"
+fi
 url=http://127.0.0.1:$port/
 load() {   # name, wperfk args...
   local name=$1; shift
