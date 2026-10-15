@@ -32,6 +32,8 @@ if [ "$os" = windows ]; then
   else (cd "$stage" && 7z a -tzip -bso0 "$out" ./*); fi   # Windows runners ship 7z, not zip
   echo "dist/$name.zip"
 else
-  tar -C "$stage" -czf "dist/$name.tar.gz" .
+  # Name the files: archiving "." adds a ./ entry with mktemp's 0700 mode,
+  # which tar applies to the directory the user extracts into.
+  tar -C "$stage" -czf "dist/$name.tar.gz" "$(basename "$bin")" LICENSE NOTICE README.md
   echo "dist/$name.tar.gz"
 fi

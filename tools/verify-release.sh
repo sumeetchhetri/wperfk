@@ -29,6 +29,12 @@ case $asset in
   *)     tar xzf "$asset" -C x ;;
 esac
 exe=; case $plat in windows_*) exe=.exe ;; esac
+"$PY" - "$asset" "wperfk$exe" <<'PY' || fail "archive must hold exactly LICENSE NOTICE README.md wperfk$exe at its root"
+import sys, tarfile, zipfile
+a = sys.argv[1]
+names = zipfile.ZipFile(a).namelist() if a.endswith('.zip') else tarfile.open(a).getnames()
+sys.exit(sorted(names) != sorted(['LICENSE', 'NOTICE', 'README.md', sys.argv[2]]))
+PY
 bin=x/wperfk$exe
 for f in LICENSE NOTICE README.md "wperfk$exe"; do [ -f "x/$f" ] || fail "archive lacks $f"; done
 ok "archive layout"
