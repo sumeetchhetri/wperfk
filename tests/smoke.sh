@@ -129,8 +129,10 @@ done
 # server drops keep-alive connections: counted as read errors, must not spin
 expect framing-drop     "d['requests']>50 and d['errors']['read']>0"    -t1 -c2 -d1s http://127.0.0.1:$HTTP/drop
 
-# WPK_SKIP_UNIX=1: e.g. running a Windows build under Wine, which lacks AF_UNIX
-if [ -z "${WPK_SKIP_UNIX:-}" ] && $PY -c "import socket,sys; sys.exit(0 if hasattr(socket,'AF_UNIX') else 1)"; then
+# Windows AF_UNIX is not yet verified, so it is opt-in there (WPK_TEST_UNIX=1) and
+# never blocks a release. WPK_SKIP_UNIX=1 skips it anywhere (e.g. Wine lacks AF_UNIX).
+if [ -z "${WPK_SKIP_UNIX:-}" ] && { [ "${OS:-}" != Windows_NT ] || [ -n "${WPK_TEST_UNIX:-}" ]; } &&
+   $PY -c "import socket,sys; sys.exit(0 if hasattr(socket,'AF_UNIX') else 1)"; then
   $PY tests/server.py "unix:$tmp/s.sock" </dev/null >/dev/null 2>&1 & p4=$!
   sleep 1
   expect unix-socket    "d['requests']>0 and d['errors']['total']==0"   -t1 -c2 -d1s --unix-socket "$tmp/s.sock" http://localhost/

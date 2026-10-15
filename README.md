@@ -66,7 +66,7 @@ This is our reading of the licences, not legal advice. If any upstream author se
 | Machine-readable results | `--json` | P5 |
 | Live progress | `--progress` to stderr (stdout stays clean for JSON) | P5 |
 | mTLS and SNI | `--cert`, `--key`, `--cacert`, `--sni`, `--verify` | P5 |
-| Unix socket targets | `--unix-socket PATH` (also Windows 10 1803+ AF_UNIX; not named pipes) | P6 |
+| Unix socket targets | `--unix-socket PATH` (Windows 10 1803+ AF_UNIX builds but is untested; not named pipes) | P6 |
 | Request sequences with state (login → token) | Lua `request()`/`response()`; example `scripts/login-token.lua` | P5 |
 | Unique IDs in bodies | Example `scripts/unique-id.lua` (no new flag) | P5 |
 | HAR import | `--targets file.har`: no separate converter step | P6 |

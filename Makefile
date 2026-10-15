@@ -25,6 +25,8 @@ else ifeq ($(TARGET), linux)
 else ifeq ($(TARGET), freebsd)
 	CFLAGS  += -D_DECLARE_C99_LDBL_MATH
 	LDFLAGS += -Wl,-E
+	# LuaJIT defaults to CC=gcc; FreeBSD ships only cc (clang).
+	LUAJIT_MAKEFLAGS ?= CC=$(CC)
 else ifeq ($(TARGET), windows)
 	# gnu99: MinGW hides POSIX names (fdopen, dup, ...) under strict C99.
 	CFLAGS  := $(filter-out -std=c99,$(CFLAGS)) -std=gnu99
