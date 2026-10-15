@@ -228,7 +228,7 @@ Each `v*` tag publishes:
 | Windows | fully static (MinGW, UCRT) | Windows 10 / Server 2016 and later; system DLLs only |
 | FreeBSD | fully static | FreeBSD 14 and later |
 
-Every binary is stripped, and each is smoke-tested before it is packaged. To dry-run the whole pipeline without publishing, run the `release` workflow manually from the Actions tab.
+Every binary is stripped, and each is smoke-tested before it is packaged. The release stays a draft until every archive passes `tools/verify-release.sh` on a clean runner of its own platform (checksum, version, static/dylib/minimum-OS checks, and a real load run). To dry-run the whole pipeline without publishing, run the `release` workflow manually from the Actions tab.
 
 ## Building from source
 

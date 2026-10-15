@@ -203,11 +203,10 @@ jobs:
           cd dist && sha256sum wperfk_* > "wperfk_${VERSION}_checksums.txt"
           cat "wperfk_${VERSION}_checksums.txt"
 
-      - name: Upload dry-run bundle
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
+      # Input for the verify matrix (and the dry-run bundle on workflow_dispatch).
+      - uses: actions/upload-artifact@v4
         with:
-          name: wperfk-release-dry-run
+          name: wperfk-release-assets
           path: dist/*
 
       - uses: actions/attest-build-provenance@v2
@@ -215,19 +214,82 @@ jobs:
         with:
           subject-path: dist/wperfk_*
 
-      - name: Publish release
+      # Draft until the verify matrix passes; the publish job makes it public.
+      - name: Create draft release
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           pre=""; case "$GITHUB_REF_NAME" in *-*) pre="--prerelease";; esac
           gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
-            --title "$GITHUB_REF_NAME" --generate-notes $pre
+            --title "$GITHUB_REF_NAME" --generate-notes --draft $pre
+
+      - name: Check uploaded assets and attestations
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --dir rel
+          cd rel
+          for p in linux_amd64 linux_arm64 darwin_amd64 darwin_arm64 darwin_universal; do
+            [ -f "wperfk_${VERSION}_${p}.tar.gz" ] || { echo "::error::missing $p"; exit 1; }
+          done
+          for p in windows_amd64 windows_arm64; do
+            [ -f "wperfk_${VERSION}_${p}.zip" ] || { echo "::error::missing $p"; exit 1; }
+          done
+          sha256sum -c "wperfk_${VERSION}_checksums.txt"
+          for f in "wperfk_${VERSION}"_*.tar.gz "wperfk_${VERSION}"_*.zip; do
+            gh attestation verify "$f" --repo "$GITHUB_REPOSITORY" > /dev/null
+            echo "attested: $f"
+          done
+
+  # Every asset, on a clean runner of its own platform: checksum, layout,
+  # version, platform properties and a real load run (tools/verify-release.sh).
+  verify:
+    needs: release
+    name: verify-${{ matrix.plat }}-${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { plat: linux_amd64,      runner: ubuntu-24.04 }
+          - { plat: linux_arm64,      runner: ubuntu-24.04-arm }
+          - { plat: darwin_amd64,     runner: macos-15-intel }
+          - { plat: darwin_arm64,     runner: macos-15 }
+          - { plat: darwin_universal, runner: macos-15-intel }
+          - { plat: darwin_universal, runner: macos-15 }
+          - { plat: windows_amd64,    runner: windows-2025 }
+          - { plat: windows_arm64,    runner: windows-11-arm }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: wperfk-release-assets
+          path: rel
+      - run: tools/verify-release.sh rel "${GITHUB_REF_NAME#v}" ${{ matrix.plat }}
+
+  publish:
+    needs: verify
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
 
   # Stable tags only: refresh Formula/ (Homebrew) and bucket/ (Scoop) on main,
   # and open a winget-pkgs PR when a WINGET_TOKEN secret is configured.
   packages:
-    needs: release
+    needs: publish
     if: ${{ github.event_name == 'push' && !contains(github.ref_name, '-') }}
     runs-on: ubuntu-24.04
     env:
