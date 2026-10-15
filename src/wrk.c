@@ -5,6 +5,7 @@
 #include "main.h"
 #include "hdr_histogram.h"
 #include "stats.h"
+#include "prometheus.h"
 
 // Max recordable latency of 1 day
 #define MAX_LATENCY (24LL * 60 * 60 * 1000000)
@@ -42,6 +43,8 @@ static struct config {
     bool     status_codes;
     tls_opts tls;
     char    *resolve;
+    char    *unix_socket;
+    char    *prometheus;
 } cfg;
 
 static struct {
@@ -57,7 +60,8 @@ static struct sock sock = {
     .readable = sock_readable
 };
 
-static struct http_parser_settings parser_settings = {
+static llhttp_settings_t parser_settings = {
+    .on_message_begin    = response_begin,
     .on_message_complete = response_complete
 };
 
@@ -71,6 +75,8 @@ static uint64_t responses_total = 0;
 static uint64_t errors_total    = 0;
 static uint64_t warmup_end      = 0;
 static int      threads_running = 0;
+static thread  *all_threads     = NULL;
+static char    *run_url         = NULL;
 
 static void handler(int sig) {
     stopped_by = STOP_SIGNAL;
@@ -106,7 +112,7 @@ static void usage() {
            "        --json             Print JSON summary on stdout; all other   \n"
            "                           output (incl. Lua print) goes to stderr  \n"
            "        --progress    <T>  Print live progress to stderr every T    \n"
-           "        --targets     <F>  Request targets file (vegeta HTTP format),\n"
+           "        --targets     <F>  Request targets: vegeta HTTP format or HAR,\n"
            "                           sent round-robin; URL may be omitted     \n"
            "        --status-codes     Print responses per status code          \n"
            "        --expect-status <L> Allowed codes, e.g. 200,204 or 2xx       \n"
@@ -118,6 +124,10 @@ static void usage() {
            "        --cert/--key  <F>  Client certificate and key (mTLS, PEM)   \n"
            "        --sni         <S>  TLS server name (default: URL host)      \n"
            "        --resolve <H:P:A>  Connect to address A for host H port P   \n"
+           "        --unix-socket <P>  Connect to a Unix socket; the URL still   \n"
+           "                           sets Host, path and scheme               \n"
+           "        --prometheus <[H:]P> Serve live metrics for Prometheus      \n"
+           "                           (default host 127.0.0.1)                 \n"
            "                                                      \n"
            "  wperfk merge [--json] <hist files...>  Combine --hist-out results \n"
            "                                                      \n"
@@ -186,12 +196,19 @@ int main(int argc, char **argv) {
     pthread_mutex_init(&statistics.mutex, NULL);
     statistics.requests = stats_alloc(10);
     thread *threads = zcalloc(cfg.threads * sizeof(thread));
+    all_threads = threads;
+    run_url     = url;
 
     hdr_init(1, MAX_LATENCY, 3, &(statistics.requests->histogram));
 
 
     lua_State *L = script_create(cfg.script, url, headers);
-    if (!script_resolve(L, connect_host, connect_service)) {
+    if (cfg.unix_socket) {
+        if (!script_unix_addr(L, cfg.unix_socket)) {
+            fprintf(stderr, "unable to connect to unix socket %s\n", cfg.unix_socket);
+            exit(1);
+        }
+    } else if (!script_resolve(L, connect_host, connect_service)) {
         char *msg = strerror(errno);
         fprintf(stderr, "unable to connect to %s:%s %s\n", connect_host, connect_service, msg);
         exit(1);
@@ -202,6 +219,15 @@ int main(int argc, char **argv) {
     if (cfg.requests && !cfg.duration_set) {
         cfg.duration = 100 * 365 * 24 * 3600ULL; // -n without -d: run until N responses
     }
+    if (cfg.prometheus) {
+        int rc = prom_start(cfg.prometheus, render_metrics);
+        if (rc) {
+            fprintf(stderr, "unable to serve Prometheus metrics on %s: %s\n", cfg.prometheus,
+                    rc == -2 ? "cannot resolve address" : strerror(errno));
+            exit(1);
+        }
+    }
+
     warmup_end           = time_us() + (cfg.warmup * 1000000);
     uint64_t stop_at     = warmup_end + (cfg.duration * 1000000);
 
@@ -619,7 +645,7 @@ static int sample_rate(aeEventLoop *loop, long long id, void *data) {
     return thread->interval;
 }
 
-static int header_field(http_parser *parser, const char *at, size_t len) {
+static int header_field(llhttp_t *parser, const char *at, size_t len) {
     connection *c = parser->data;
     if (c->state == VALUE) {
         *c->headers.cursor++ = '\0';
@@ -629,7 +655,7 @@ static int header_field(http_parser *parser, const char *at, size_t len) {
     return 0;
 }
 
-static int header_value(http_parser *parser, const char *at, size_t len) {
+static int header_value(llhttp_t *parser, const char *at, size_t len) {
     connection *c = parser->data;
     if (c->state == FIELD) {
         *c->headers.cursor++ = '\0';
@@ -639,7 +665,7 @@ static int header_value(http_parser *parser, const char *at, size_t len) {
     return 0;
 }
 
-static int response_body(http_parser *parser, const char *at, size_t len) {
+static int response_body(llhttp_t *parser, const char *at, size_t len) {
     connection *c = parser->data;
     buffer_append(&c->body, at, len);
     return 0;
@@ -698,12 +724,20 @@ static int delay_request(aeEventLoop *loop, long long id, void *data) {
     return AE_NOMORE;
 }
 
-static int response_complete(http_parser *parser) {
+static int response_begin(llhttp_t *parser) {
+    connection *c = parser->data;
+    c->in_response = true;
+    return 0;
+}
+
+static int response_complete(llhttp_t *parser) {
     connection *c = parser->data;
     thread *thread = c->thread;
     uint64_t now = time_us();
     int status = parser->status_code;
     bool last = false;
+
+    c->in_response = false;
 
     if (stop) {
         aeStop(thread->loop);
@@ -810,12 +844,11 @@ static int response_complete(http_parser *parser) {
     }
 
 
-    if (!http_should_keep_alive(parser)) {
+    if (!llhttp_should_keep_alive(parser)) {
         reconnect_socket(thread, c);
         goto done;
     }
-
-    http_parser_init(parser, HTTP_RESPONSE);
+    // llhttp continues with the next response on this connection by itself.
 
   done:
     return 0;
@@ -830,7 +863,10 @@ static void socket_connected(aeEventLoop *loop, int fd, void *data, int mask) {
         case RETRY: return;
     }
 
-    http_parser_init(&c->parser, HTTP_RESPONSE);
+    llhttp_init(&c->parser, HTTP_RESPONSE, &parser_settings);
+    c->in_response = false;
+    llhttp_set_lenient_optional_cr_before_lf(&c->parser, 1); // http_parser accepted bare LF
+    c->parser.data = c;
     c->written = 0;
 
     aeCreateFileEvent(c->thread->loop, fd, AE_READABLE, socket_readable, c);
@@ -922,7 +958,15 @@ static void socket_readable(aeEventLoop *loop, int fd, void *data, int mask) {
             case RETRY: return;
         }
 
-        if (http_parser_execute(&c->parser, &parser_settings, c->buf, n) != n) goto error;
+        if (n == 0) {
+            // EOF completes a close-delimited response (response_complete then
+            // reconnects, unless the run is stopping). EOF anywhere else, idle
+            // or mid-body, means the server closed on us: a read error.
+            bool completes = c->in_response && llhttp_message_needs_eof(&c->parser);
+            if (llhttp_finish(&c->parser) != HPE_OK || !completes) goto error;
+            return;
+        }
+        if (llhttp_execute(&c->parser, c->buf, n) != HPE_OK) goto error;
         c->thread->bytes += n;
     } while (n == RECVBUF && sock.readable(c) > 0);
 
@@ -994,6 +1038,8 @@ static struct option longopts[] = {
     { "key",            required_argument, NULL, OPT_KEY },
     { "sni",            required_argument, NULL, OPT_SNI },
     { "resolve",        required_argument, NULL, OPT_RESOLVE },
+    { "unix-socket",    required_argument, NULL, OPT_UNIX },
+    { "prometheus",     required_argument, NULL, OPT_PROMETHEUS },
     { NULL,             0,                 NULL,  0  }
 };
 
@@ -1100,6 +1146,12 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
                 break;
             case OPT_RESOLVE:
                 cfg->resolve = optarg;
+                break;
+            case OPT_UNIX:
+                cfg->unix_socket = optarg;
+                break;
+            case OPT_PROMETHEUS:
+                cfg->prometheus = optarg;
                 break;
             case 'm':
                 cfg->method = optarg;
@@ -1349,6 +1401,39 @@ static int parse_expect_status(char *spec, bool *allowed) {
     return rc;
 }
 
+// HAR: the first "url" string is log.entries[0].request.url.
+static char *har_first_url(FILE *f) {
+    size_t len = 0, cap = 1 << 16, n;
+    char *buf = zmalloc(cap), *found = NULL;
+    while ((n = fread(buf + len, 1, cap - len - 1, f)) > 0) {
+        len += n;
+        if (len + 1 == cap) buf = zrealloc(buf, cap *= 2);
+    }
+    buf[len] = '\0';
+    for (char *p = strstr(buf, "\"url\""); p && !found; p = strstr(p + 5, "\"url\"")) {
+        char *q = p + 5;
+        while (isspace((unsigned char) *q)) q++;
+        if (*q++ != ':') continue;
+        while (isspace((unsigned char) *q)) q++;
+        if (*q++ != '"') continue;
+        char *out = found = zmalloc(strlen(q) + 2);
+        for (; *q && *q != '"'; q++) {
+            if (*q == '\\' && q[1]) q++;   // "\/" -> "/" (other escapes don't occur in URLs)
+            *out++ = *q;
+        }
+        *out = '\0';
+        // Only the origin matters (targets carry their own paths): keep scheme://authority/
+        char *auth = strstr(found, "://");
+        if (auth) {
+            char *end = auth + 3 + strcspn(auth + 3, "/?#");
+            end[0] = '/';
+            end[1] = '\0';
+        }
+    }
+    zfree(buf);
+    return found;
+}
+
 // URL of the first target, used when no URL argument is given.
 static char *targets_first_url(const char *path) {
     FILE *f = fopen(path, "rb");
@@ -1356,6 +1441,15 @@ static char *targets_first_url(const char *path) {
         fprintf(stderr, "unable to read targets %s: %s\n", path, strerror(errno));
         return NULL;
     }
+    int first = fgetc(f);
+    while (first != EOF && isspace(first)) first = fgetc(f);
+    if (first == '{') {
+        char *url = har_first_url(f);
+        fclose(f);
+        if (!url) fprintf(stderr, "%s: no request URL found in HAR file\n", path);
+        return url;
+    }
+    rewind(f);
     char line[8192], method[32], url[8192 - 32];
     char *found = NULL;
     while (fgets(line, sizeof(line), f)) {
@@ -1588,4 +1682,88 @@ static int merge_main(int argc, char **argv) {
     printf("Requests/sec: %9.2f\n", runtime_s > 0 ? total.requests / runtime_s : 0.0);
     printf("Transfer/sec: %10sB\n", format_binary(runtime_s > 0 ? total.bytes / runtime_s : 0));
     return 0;
+}
+
+// --prometheus: live counters (unlocked reads: approximate while running;
+// counters restart when --warmup ends).
+static void prom_label(char **out, const char *s) {
+    for (; *s; s++) {
+        if (*s == '\\' || *s == '"') aprintf(out, "\\%c", *s);
+        else if (*s == '\n') aprintf(out, "\\n");
+        else aprintf(out, "%c", *s);
+    }
+}
+
+// hdr_add() iterates until the source's total_count, which a worker thread
+// may move past the counts it has already scanned: it can then walk off the
+// end of the array. Copy live histograms with a loop bounded by counts_len.
+static void hist_add_live(struct hdr_histogram *dst, struct hdr_histogram *src) {
+    for (int i = 0; i < dst->counts_len && i < src->counts_len; i++) {
+        int64_t n = src->counts[i];
+        dst->counts[i]   += n;
+        dst->total_count += n;
+    }
+}
+
+static char *render_metrics(size_t *len) {
+    char *out = NULL;
+    uint64_t req = 0, bytes = 0, codes[600] = { 0 };
+    errors e = { 0 };
+    struct hdr_histogram *h;
+    hdr_init(1, MAX_LATENCY, 3, &h);
+
+    for (uint64_t i = 0; i < cfg.threads; i++) {
+        thread *t = &all_threads[i];
+        if (!t->latency_histogram) continue;   // not started yet
+        req   += t->complete;
+        bytes += t->bytes;
+        e.connect  += t->errors.connect;
+        e.read     += t->errors.read;
+        e.write    += t->errors.write;
+        e.timeout  += t->errors.timeout;
+        e.status   += t->errors.status;
+        e.mismatch += t->errors.mismatch;
+        for (int s = 0; s < 600; s++) codes[s] += t->status_codes[s];
+        hist_add_live(h, t->latency_histogram);
+    }
+
+    uint64_t now = time_us();
+    aprintf(&out, "# HELP wperfk_info Run configuration.\n# TYPE wperfk_info gauge\n");
+    aprintf(&out, "wperfk_info{version=\"%s\",mode=\"%s\",url=\"", VERSION, cfg.rate ? "rate" : "closed");
+    prom_label(&out, run_url ? run_url : "");
+    aprintf(&out, "\"} 1\n");
+    aprintf(&out, "# HELP wperfk_running 1 while the load test runs.\n# TYPE wperfk_running gauge\n"
+                  "wperfk_running %d\n", __sync_add_and_fetch(&threads_running, 0) > 0);
+    aprintf(&out, "# HELP wperfk_elapsed_seconds Measured time so far (0 during warmup).\n"
+                  "# TYPE wperfk_elapsed_seconds gauge\nwperfk_elapsed_seconds %.3f\n",
+            now > warmup_end ? (now - warmup_end) / 1e6 : 0.0);
+    aprintf(&out, "# HELP wperfk_connections Configured connections.\n# TYPE wperfk_connections gauge\n"
+                  "wperfk_connections %"PRIu64"\n", cfg.connections);
+    aprintf(&out, "# HELP wperfk_target_rate Configured -R rate in requests/s (0: closed loop).\n"
+                  "# TYPE wperfk_target_rate gauge\nwperfk_target_rate %"PRIu64"\n", cfg.rate);
+    aprintf(&out, "# HELP wperfk_requests_total Completed responses.\n# TYPE wperfk_requests_total counter\n"
+                  "wperfk_requests_total %"PRIu64"\n", req);
+    aprintf(&out, "# HELP wperfk_bytes_total Bytes read.\n# TYPE wperfk_bytes_total counter\n"
+                  "wperfk_bytes_total %"PRIu64"\n", bytes);
+    aprintf(&out, "# HELP wperfk_errors_total Errors by type.\n# TYPE wperfk_errors_total counter\n");
+    const char *names[] = { "connect", "read", "write", "timeout", "status", "mismatch" };
+    uint32_t vals[] = { e.connect, e.read, e.write, e.timeout, e.status, e.mismatch };
+    for (int i = 0; i < 6; i++) aprintf(&out, "wperfk_errors_total{type=\"%s\"} %u\n", names[i], vals[i]);
+    aprintf(&out, "# HELP wperfk_responses_total Responses by status code.\n# TYPE wperfk_responses_total counter\n");
+    for (int s = 0; s < 600; s++) {
+        if (codes[s]) aprintf(&out, "wperfk_responses_total{code=\"%d\"} %"PRIu64"\n", s, codes[s]);
+    }
+    aprintf(&out, "# HELP wperfk_latency_seconds Response latency (coordinated-omission corrected with -R).\n"
+                  "# TYPE wperfk_latency_seconds summary\n");
+    const double q[] = { 0.5, 0.9, 0.99, 0.999 };
+    for (int i = 0; i < 4; i++) {
+        double v = h->total_count ? hdr_value_at_percentile(h, q[i] * 100) / 1e6 : 0;
+        aprintf(&out, "wperfk_latency_seconds{quantile=\"%g\"} %.6f\n", q[i], v);
+    }
+    aprintf(&out, "wperfk_latency_seconds_sum %.6f\nwperfk_latency_seconds_count %"PRId64"\n",
+            h->total_count ? hdr_mean(h) * h->total_count / 1e6 : 0.0, h->total_count);
+
+    free(h);
+    *len = out ? strlen(out) : 0;
+    return out;
 }

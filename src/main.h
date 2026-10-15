@@ -40,10 +40,11 @@ static void socket_connected(aeEventLoop *, int, void *, int);
 static void socket_writeable(aeEventLoop *, int, void *, int);
 static void socket_readable(aeEventLoop *, int, void *, int);
 
-static int response_complete(http_parser *);
-static int header_field(http_parser *, const char *, size_t);
-static int header_value(http_parser *, const char *, size_t);
-static int response_body(http_parser *, const char *, size_t);
+static int response_begin(llhttp_t *);
+static int response_complete(llhttp_t *);
+static int header_field(llhttp_t *, const char *, size_t);
+static int header_value(llhttp_t *, const char *, size_t);
+static int response_body(llhttp_t *, const char *, size_t);
 
 static uint64_t time_us();
 
@@ -60,6 +61,7 @@ static int parse_expect_status(char *, bool *);
 static char *targets_first_url(const char *);
 static int apply_resolve(char *, char *, char *, char *, char **, char **);
 static void progress_loop(thread *);
+static char *render_metrics(size_t *);
 static int write_hist(const char *, const char *, hist_meta *, uint64_t *,
                       struct hdr_histogram *, struct hdr_histogram *);
 static int scan_rate(char *, uint64_t *);

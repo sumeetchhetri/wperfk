@@ -121,4 +121,50 @@ expect tls-sni          "d['requests']>0 and d['errors']['total']==0"   -t1 -c2 
 expect mtls-no-cert     "d['requests']==0"                              -t1 -c2 -d1s https://localhost:$MTLS/
 expect mtls-cert        "d['requests']>0 and d['errors']['total']==0"   -t1 -c2 -d1s --cert "$tmp/cc.pem" --key "$tmp/ck.pem" https://localhost:$MTLS/
 expect resolve          "d['requests']>0 and d['errors']['total']==0"   -t1 -c2 -d1s --resolve wperfk.invalid:$HTTP:127.0.0.1 http://wperfk.invalid:$HTTP/
+
+# P6: response framings (llhttp), dropped connections, Unix sockets, HAR, Prometheus
+for f in chunked close http10 lf 204 big; do
+  expect "framing-$f" "d['requests']>0 and d['errors']['total']==0" -t1 -c2 -d1s http://127.0.0.1:$HTTP/$f
+done
+# server drops keep-alive connections: counted as read errors, must not spin
+expect framing-drop     "d['requests']>50 and d['errors']['read']>0"    -t1 -c2 -d1s http://127.0.0.1:$HTTP/drop
+
+# WPK_SKIP_UNIX=1: e.g. running a Windows build under Wine, which lacks AF_UNIX
+if [ -z "${WPK_SKIP_UNIX:-}" ] && $PY -c "import socket,sys; sys.exit(0 if hasattr(socket,'AF_UNIX') else 1)"; then
+  $PY tests/server.py "unix:$tmp/s.sock" </dev/null >/dev/null 2>&1 & p4=$!
+  sleep 1
+  expect unix-socket    "d['requests']>0 and d['errors']['total']==0"   -t1 -c2 -d1s --unix-socket "$tmp/s.sock" http://localhost/
+  kill $p4 2>/dev/null
+else
+  echo "skip unix-socket (no AF_UNIX test server here)"
+fi
+
+$PY - "$tmp/t.har" $HTTP <<'PYEOF2'
+import json, sys
+u = "http://127.0.0.1:%s" % sys.argv[2]
+e = lambda m, url, h=(), body=None: {"request": {"method": m, "url": url,
+     "headers": [{"name": k, "value": v} for k, v in h],
+     **({"postData": {"mimeType": "text/plain", "text": body}} if body else {})}}
+json.dump({"log": {"version": "1.2", "entries": [
+    e("GET", u + "/har-get", [(":authority", "x"), ("Accept", "*/*")]),
+    e("POST", u + "/expect-post", [("X-Test", "1"), ("Content-Length", "999")], "hello-wperfk"),
+    e("GET", "https://cdn.example.com/skipped.js")]}}, open(sys.argv[1], "w"))
+PYEOF2
+$PY -c "import urllib.request as u;u.urlopen('http://127.0.0.1:$HTTP/__reset')"
+expect har              "d['requests']>0 and set(d['status_codes'])=={'200'}" -t1 -c2 -d1s --targets "$tmp/t.har"
+if hits | $PY -c "import json,sys; h=json.load(sys.stdin); a,b=h.get('GET /har-get',0),h.get('POST /expect-post',0); sys.exit(0 if a>0 and b>0 and abs(a-b)<=4 else 1)"
+then echo "ok   har-round-robin"; else echo "FAIL har-round-robin"; hits; fail=1; fi
+
+PROM=18990
+"$BIN" -t1 -c2 -d3s --prometheus 127.0.0.1:$PROM $B >/dev/null 2>&1 & pp=$!
+sleep 1.5
+if $PY - $PROM <<'PYEOF2'
+import sys, urllib.request as u
+body = u.urlopen("http://127.0.0.1:%s/metrics" % sys.argv[1], timeout=5).read().decode()
+vals = dict(l.rsplit(" ", 1) for l in body.splitlines() if l and not l.startswith("#"))
+assert float(vals["wperfk_requests_total"]) > 0 and vals["wperfk_running"] == "1", body
+assert "# TYPE wperfk_latency_seconds summary" in body
+PYEOF2
+then echo "ok   prometheus"; else echo "FAIL prometheus"; fail=1; fi
+wait $pp
 exit $fail

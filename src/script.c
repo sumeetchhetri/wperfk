@@ -1,10 +1,12 @@
 // Copyright (C) 2013 - Will Glozer.  All rights reserved.
 
+#include <stddef.h>
 #include <stdlib.h>
 #include <sys/time.h>
 #include <string.h>
 #include "script.h"
-#include "http_parser.h"
+#include "llhttp.h"
+#include "url.h"
 #include "stats.h"
 #include "zmalloc.h"
 
@@ -37,6 +39,7 @@ typedef struct {
 } table_field;
 
 static int script_addr_tostring(lua_State *);
+struct addrinfo *script_addr_clone(lua_State *, struct addrinfo *);
 static int script_addr_gc(lua_State *);
 static int script_stats_len(lua_State *);
 static int script_stats_percentile(lua_State *);
@@ -167,6 +170,40 @@ bool script_resolve(lua_State *L, char *host, char *service) {
     size_t count = lua_objlen(L, -1);
     lua_pop(L, 2);
     return count > 0;
+}
+
+// --unix-socket: wrk.addrs = { <AF_UNIX addr> }, probed with wrk.connect().
+bool script_unix_addr(lua_State *L, const char *path) {
+    struct sockaddr_un sun;
+    memset(&sun, 0, sizeof(sun));
+    if (strlen(path) >= sizeof(sun.sun_path)) return false;
+    sun.sun_family = AF_UNIX;
+    strcpy(sun.sun_path, path);
+    socklen_t len = (socklen_t) (offsetof(struct sockaddr_un, sun_path) + strlen(path) + 1);
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+    sun.sun_len = (unsigned char) len;
+#endif
+    struct addrinfo ai = {
+        .ai_family   = AF_UNIX,
+        .ai_socktype = SOCK_STREAM,
+        .ai_addrlen  = len,
+        .ai_addr     = (struct sockaddr *) &sun,
+    };
+
+    lua_getglobal(L, "wrk");
+    lua_newtable(L);
+    script_addr_clone(L, &ai);
+    lua_rawseti(L, -2, 1);
+    lua_setfield(L, -2, "addrs");
+
+    lua_getfield(L, -1, "connect");
+    lua_getfield(L, -2, "addrs");
+    lua_rawgeti(L, -1, 1);
+    lua_remove(L, -2);
+    lua_call(L, 1, 1);
+    bool ok = lua_toboolean(L, -1);
+    lua_pop(L, 2);
+    return ok;
 }
 
 void script_push_thread(lua_State *L, thread *t) {
@@ -320,30 +357,29 @@ void script_done(lua_State *L, stats *latency, stats *requests) {
     lua_pop(L, 1);
 }
 
-static int verify_request(http_parser *parser) {
+static int verify_request(llhttp_t *parser) {
     size_t *count = parser->data;
     (*count)++;
     return 0;
 }
 
 size_t script_verify_request(lua_State *L) {
-    http_parser_settings settings = {
-        .on_message_complete = verify_request
-    };
-    http_parser parser;
+    llhttp_settings_t settings;
+    llhttp_t parser;
     char *request = NULL;
     size_t len, count = 0;
 
+    llhttp_settings_init(&settings);
+    settings.on_message_complete = verify_request;
     script_request(L, &request, &len);
-    http_parser_init(&parser, HTTP_REQUEST);
+    llhttp_init(&parser, HTTP_REQUEST, &settings);
     parser.data = &count;
 
-    size_t parsed = http_parser_execute(&parser, &settings, request, len);
+    llhttp_errno_t err = llhttp_execute(&parser, request, len);
+    size_t parsed = err == HPE_OK ? len : (size_t) (llhttp_get_error_pos(&parser) - request);
 
-    if (parsed != len || count == 0) {
-        enum http_errno err = HTTP_PARSER_ERRNO(&parser);
-        const char *desc = http_errno_description(err);
-        const char *msg = err != HPE_OK ? desc : "incomplete request";
+    if (err != HPE_OK || count == 0) {
+        const char *msg = err != HPE_OK ? llhttp_get_error_reason(&parser) : "incomplete request";
         int line = 1, column = 1;
 
         for (char *c = request; c < request + parsed; c++) {
@@ -383,6 +419,10 @@ struct addrinfo *script_addr_clone(lua_State *L, struct addrinfo *addr) {
 
 static int script_addr_tostring(lua_State *L) {
     struct addrinfo *addr = checkaddr(L);
+    if (addr->ai_family == AF_UNIX) {
+        lua_pushfstring(L, "unix:%s", ((struct sockaddr_un *) addr->ai_addr)->sun_path);
+        return 1;
+    }
     char host[NI_MAXHOST];
     char service[NI_MAXSERV];
 

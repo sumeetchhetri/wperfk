@@ -118,7 +118,145 @@ local function format_target(method, path, headers, body)
    return table.concat(s, "\r\n")
 end
 
+-- Minimal JSON decoder (for HAR files).
+local function json_decode(s)
+   local pos = 1
+   local function fail(what)
+      error(string.format("invalid JSON at byte %d: %s", pos, what), 0)
+   end
+   local function ws()
+      pos = s:find("[^ \t\r\n]", pos) or #s + 1
+   end
+   local escapes = { ['"'] = '"', ["\\"] = "\\", ["/"] = "/", b = "\b", f = "\f", n = "\n", r = "\r", t = "\t" }
+   local function utf8(cp)
+      if cp < 0x80 then return string.char(cp) end
+      if cp < 0x800 then return string.char(0xC0 + math.floor(cp / 0x40), 0x80 + cp % 0x40) end
+      if cp < 0x10000 then
+         return string.char(0xE0 + math.floor(cp / 0x1000), 0x80 + math.floor(cp / 0x40) % 0x40, 0x80 + cp % 0x40)
+      end
+      return string.char(0xF0 + math.floor(cp / 0x40000), 0x80 + math.floor(cp / 0x1000) % 0x40,
+                         0x80 + math.floor(cp / 0x40) % 0x40, 0x80 + cp % 0x40)
+   end
+   local value
+   local function str()
+      local out, i = {}, pos + 1
+      while true do
+         local j = s:find('["\\]', i)
+         if not j then fail("unterminated string") end
+         out[#out+1] = s:sub(i, j - 1)
+         if s:sub(j, j) == '"' then pos = j + 1; return table.concat(out) end
+         local e = s:sub(j + 1, j + 1)
+         if e == "u" then
+            local cp = tonumber(s:sub(j + 2, j + 5), 16) or fail("bad \\u escape")
+            i = j + 6
+            if cp >= 0xD800 and cp < 0xDC00 and s:sub(i, i + 1) == "\\u" then
+               local lo = tonumber(s:sub(i + 2, i + 5), 16)
+               if lo and lo >= 0xDC00 and lo < 0xE000 then
+                  cp = 0x10000 + (cp - 0xD800) * 0x400 + (lo - 0xDC00)
+                  i = i + 6
+               end
+            end
+            out[#out+1] = utf8(cp)
+         else
+            out[#out+1] = escapes[e] or fail("bad escape")
+            i = j + 2
+         end
+      end
+   end
+   function value()
+      ws()
+      local c = s:sub(pos, pos)
+      if c == "{" then
+         local t = {}
+         pos = pos + 1; ws()
+         if s:sub(pos, pos) == "}" then pos = pos + 1; return t end
+         while true do
+            ws()
+            if s:sub(pos, pos) ~= '"' then fail("expected key") end
+            local k = str()
+            ws()
+            if s:sub(pos, pos) ~= ":" then fail("expected ':'") end
+            pos = pos + 1
+            t[k] = value()
+            ws()
+            c = s:sub(pos, pos); pos = pos + 1
+            if c == "}" then return t end
+            if c ~= "," then fail("expected ',' or '}'") end
+         end
+      elseif c == "[" then
+         local t = {}
+         pos = pos + 1; ws()
+         if s:sub(pos, pos) == "]" then pos = pos + 1; return t end
+         while true do
+            t[#t+1] = value()
+            ws()
+            c = s:sub(pos, pos); pos = pos + 1
+            if c == "]" then return t end
+            if c ~= "," then fail("expected ',' or ']'") end
+         end
+      elseif c == '"' then
+         return str()
+      elseif s:sub(pos, pos + 3) == "true" then pos = pos + 4; return true
+      elseif s:sub(pos, pos + 4) == "false" then pos = pos + 5; return false
+      elseif s:sub(pos, pos + 3) == "null" then pos = pos + 4; return nil
+      else
+         local num = s:match("^-?%d+%.?%d*[eE]?[-+]?%d*", pos)
+         if not num or num == "" then fail("unexpected '" .. c .. "'") end
+         pos = pos + #num
+         return tonumber(num)
+      end
+   end
+   local result = value()
+   ws()
+   if pos <= #s then fail("trailing data") end
+   return result
+end
+
+-- HAR (HTTP Archive, e.g. browser devtools "Save all as HAR"): the requests
+-- on the target origin become targets; other origins are skipped.
+local skip_har_header = { host = true, ["content-length"] = true, connection = true,
+                          ["transfer-encoding"] = true, ["keep-alive"] = true }
+
+local function load_har(file, data, want)
+   local ok, har = pcall(json_decode, data)
+   if not ok then wrk.fail(file .. ": " .. har) end
+   local entries = har and har.log and har.log.entries
+   if type(entries) ~= "table" then wrk.fail(file .. ": not a HAR file (no log.entries)") end
+
+   local targets, skipped = {}, 0
+   for _, e in ipairs(entries) do
+      local r = e.request or {}
+      local scheme, auth, path = tostring(r.url or ""):match("^(https?)://([^/?#]+)([^#]*)")
+      local host, port
+      if scheme then
+         host, port = auth:match("^(%[.+%]):(%d+)$")
+         if not host then host, port = auth:match("^([^:]+):(%d+)$") end
+         host = (host or auth):gsub("^.*@", "")
+      end
+      if scheme and r.method and origin(scheme, host, port) == want then
+         -- percent-encode anything outside printable ASCII (hand-edited HARs)
+         path = path:gsub("[^\33-\126]", function(c) return string.format("%%%02X", c:byte()) end)
+         local t = { method = r.method, path = path ~= "" and path or "/", headers = {} }
+         for _, h in ipairs(r.headers or {}) do
+            local name = tostring(h.name or "")
+            if name ~= "" and name:sub(1, 1) ~= ":" and not skip_har_header[name:lower()] then
+               t.headers[name] = tostring(h.value or "")
+            end
+         end
+         if r.postData and r.postData.text then t.body = r.postData.text end
+         targets[#targets+1] = t
+      else
+         skipped = skipped + 1
+      end
+   end
+   if skipped > 0 then
+      io.stderr:write(string.format("%s: skipped %d request(s) not on %s\n", file, skipped, want))
+   end
+   return targets
+end
+
 -- vegeta HTTP target format:
+-- (or a HAR file, detected by its leading '{')
 --   METHOD URL
 --   Header: value      (any number)
 --   @path/to/body      (optional)
@@ -131,6 +269,10 @@ function wrk.load_targets(file)
 
    local want = origin(wrk.scheme, wrk.host, wrk.port)
    local targets, cur, n = {}, nil, 0
+   if data:match("^%s*{") then
+      targets = load_har(file, data, want)
+      data = ""
+   end
    for line in (data .. "\n"):gmatch("([^\n]*)\n") do
       n = n + 1
       line = line:gsub("\r$", "")
@@ -164,7 +306,7 @@ function wrk.load_targets(file)
          cur.headers[name] = value
       end
    end
-   if #targets == 0 then wrk.fail(file .. ": no targets") end
+   if #targets == 0 then wrk.fail(file .. ": no targets on " .. want) end
 
    local reqs = {}
    for i, t in ipairs(targets) do

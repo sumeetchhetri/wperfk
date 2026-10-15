@@ -14,6 +14,7 @@ void script_request_defaults(const char *, const char *, size_t, uint64_t);
 void script_targets(const char *);
 
 bool script_resolve(lua_State *, char *, char *);
+bool script_unix_addr(lua_State *, const char *);
 void script_setup(lua_State *, thread *);
 void script_done(lua_State *, stats *, stats *);
 

@@ -13,7 +13,7 @@ wperfk brings together the best of the four tools most engineers reach for:
 
 Existing wrk/wrk2 Lua scripts run unmodified.
 
-> **Status: pre-alpha.** P0 and P1 are done: wrk and wrk2 modes in one binary, the combined Lua API, autocannon/vegeta-style flags, and `--json` for [GATF](https://github.com/sumeetchhetri/gatf). P2 added native Windows builds (x64 and ARM64); P3 hardened the release pipeline. See the [roadmap](#roadmap).
+> **Status: alpha.** The roadmap is complete: wrk and wrk2 modes in one binary, the combined Lua API, autocannon/vegeta-style options, `--json` for [GATF](https://github.com/sumeetchhetri/gatf), native Windows builds, package managers, HAR import, Prometheus and llhttp. See the [roadmap](#roadmap).
 
 ## Why this exists
 
@@ -66,10 +66,10 @@ This is our reading of the licences, not legal advice. If any upstream author se
 | Machine-readable results | `--json` | P5 |
 | Live progress | `--progress` to stderr (stdout stays clean for JSON) | P5 |
 | mTLS and SNI | `--cert`, `--key`, `--cacert`, `--sni`, `--verify` | P5 |
-| Unix socket / Windows named pipe targets | `--unix-socket PATH` | P6 |
+| Unix socket targets | `--unix-socket PATH` (also Windows 10 1803+ AF_UNIX; not named pipes) | P6 |
 | Request sequences with state (login → token) | Lua `request()`/`response()`; example `scripts/login-token.lua` | P5 |
 | Unique IDs in bodies | Example `scripts/unique-id.lua` (no new flag) | P5 |
-| HAR import | `wperfk har2targets` converter | P6 |
+| HAR import | `--targets file.har`: no separate converter step | P6 |
 
 ### From vegeta
 
@@ -80,7 +80,7 @@ This is our reading of the licences, not legal advice. If any upstream author se
 | Portable results that merge across machines | `--hist-out FILE` + `wperfk merge a b c` (exact HdrHistogram merge for distributed runs) | P5 |
 | Live reporting interval | `--progress <T>` | P5 |
 | DNS overrides | `--resolve host:port:addr` (curl-style) | P5 |
-| Prometheus exporter | `--prometheus :9100` | P6 |
+| Prometheus exporter | `--prometheus [HOST:]PORT` | P6 |
 
 ### Deliberately not adopted
 
@@ -165,12 +165,14 @@ wperfk -t2 -c10 -d10s -m POST --body-file req.json \
 | `--cert <F>`, `--key <F>` | Client certificate and key (PEM) for mutual TLS |
 | `--sni <S>` | TLS server name for SNI and verification (default: URL host) |
 | `--resolve <H:P:A>` | Connect to address A for host H port P, keeping H for Host, SNI and verification (curl syntax) |
+| `--unix-socket <P>` | Connect to a Unix socket; the URL still sets Host, path and scheme (like curl) |
+| `--prometheus <[H:]P>` | Serve live metrics at `/metrics` (default host 127.0.0.1) |
 
 CLI `-m/--body/-H` set defaults. A `-s` script can still override them.
 
 **Exit codes:** 0 success, 1 usage or setup error, 2 `--bailout` reached, 3 `--expect-*` mismatches.
 
-**Targets file** (vegeta's HTTP format). Targets are separated by a blank line, lines starting with `#` are comments, and `@file` sets the body. All targets must share one scheme, host and port. `-H` headers and `--body` apply to every target unless it sets its own:
+**Targets file** (vegeta's HTTP format, or a HAR file). Targets are separated by a blank line, lines starting with `#` are comments, and `@file` sets the body. All targets must share one scheme, host and port. `-H` headers and `--body` apply to every target unless it sets its own:
 
 ```
 GET https://api.example.com/users
@@ -180,6 +182,10 @@ POST https://api.example.com/users
 Content-Type: application/json
 @user.json
 ```
+
+A HAR file (browser devtools, "Save all as HAR") works as a targets file directly. Requests on the target origin are replayed round-robin with their methods, headers and bodies; requests to other origins are skipped and reported.
+
+**Prometheus:** `--prometheus 0.0.0.0:9100` exposes `wperfk_requests_total`, `wperfk_bytes_total`, `wperfk_errors_total{type}`, `wperfk_responses_total{code}`, the `wperfk_latency_seconds` summary (p50, p90, p99, p99.9), `wperfk_running` and run info. Values are read live without locks, so they are approximate while the run is in progress, and counters restart when `--warmup` ends. The endpoint stops with the process, so scrape more often than the run lasts.
 
 **Distributed runs:** run wperfk on several machines with `--hist-out node1.hist` etc., then combine them. Percentiles are merged exactly from the histogram buckets, not averaged:
 
@@ -263,21 +269,22 @@ make STATIC=1 CC=x86_64-w64-mingw32-gcc-posix WITH_OPENSSL=/path/to/mingw/openss
 | P3 | Release hardening: macOS 11+ builds (pinned OpenSSL from source), macOS universal binary, FreeBSD, stripped binaries, release dry run | ✅ done |
 | P4 | Homebrew tap, Scoop bucket, winget | ✅ done |
 | P5 | `--progress`, `--targets`, `--hist-out` + `merge`, `--expect-*`, `--status-codes`, mTLS/SNI/verify, `--resolve` | ✅ done |
-| P6 | Unix sockets / named pipes, HAR converter, Prometheus exporter, llhttp to replace archived `http_parser` | next |
+| P6 | Unix sockets, HAR import, Prometheus exporter, llhttp in place of the archived `http_parser` | ✅ done |
 
 ## Known limitations
 
 - **Platform coverage follows LuaJIT:** x86/x64, arm64, ppc, mips. riscv64 is not supported upstream; a PUC Lua 5.1 fallback build is planned, but scripts using `ffi` won't run on it.
 - **Windows throughput will be lower than Linux** on the same hardware. For high connection counts, widen the ephemeral port range: `netsh int ipv4 set dynamicport tcp start=10000 num=55535`. wepoll relies on the undocumented AFD interface, as libuv does.
 - **On Windows, output uses CRLF line endings,** including `--json`. It is still valid JSON.
-- **`http_parser` is archived upstream.** Replacing it with llhttp is planned for P6.
+- **Windows named pipes are not supported.** `--unix-socket` uses AF_UNIX, which Windows supports from Windows 10 1803.
+- **A server that closes an idle keep-alive connection** is counted as a read error, as in wrk.
 
 ## Credits
 
 wperfk exists because of **wrk** (Will Glozer), **wrk2** (Gil Tene, Mike Barker), **autocannon** (Matteo Collina and contributors) and **vegeta** (Tomás Senart and contributors). It also builds on:
 
 - the redis `ae` event loop (Salvatore Sanfilippo)
-- `http_parser` (Joyent / Node contributors)
+- llhttp (Fedor Indutny and Node.js contributors)
 - LuaJIT (Mike Pall)
 - HdrHistogram C (Michael Barker)
 - TinyMT (Saito & Matsumoto)

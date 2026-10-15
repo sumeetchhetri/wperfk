@@ -17,7 +17,8 @@
 
 #include "stats.h"
 #include "ae.h"
-#include "http_parser.h"
+#include "llhttp.h"
+#include "url.h"
 #include "hdr_histogram.h"
 
 #ifndef VERSION
@@ -49,6 +50,8 @@
 #define OPT_KEY       270
 #define OPT_SNI       271
 #define OPT_RESOLVE   272
+#define OPT_UNIX      273
+#define OPT_PROMETHEUS 274
 #define LIMITS_INTERVAL_MS 100
 
 typedef struct {
@@ -83,7 +86,8 @@ typedef struct {
 
 typedef struct connection {
     thread *thread;
-    http_parser parser;
+    llhttp_t parser;
+    bool in_response;    // a response has started and not completed
     enum {
         FIELD, VALUE
     } state;

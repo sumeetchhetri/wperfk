@@ -1,4 +1,4 @@
-CFLAGS  += -std=c99 -Wall -O2 -D_REENTRANT
+CFLAGS  += -std=c99 -Wall -O2 -D_REENTRANT -Ideps/llhttp
 ODIR    := obj
 ifneq ($(VERSION),)
 	CFLAGS += -DVERSION='"$(VERSION)"'
@@ -53,10 +53,11 @@ ifeq ($(STATIC),1)
 endif
 
 SRC  := wrk.c net.c ssl.c aprintf.c stats.c script.c units.c \
-		ae.c zmalloc.c http_parser.c tinymt64.c hdr_histogram.c $(WIN_SRC)
+		ae.c zmalloc.c url.c tinymt64.c hdr_histogram.c prometheus.c $(WIN_SRC)
 BIN  := wperfk$(EXE)
 
-OBJ  := $(patsubst %.c,$(ODIR)/%.o,$(SRC)) $(ODIR)/bytecode.o $(WIN_OBJ)
+LLHTTP_OBJ := $(ODIR)/llhttp_api.o $(ODIR)/llhttp_http.o $(ODIR)/llhttp.o
+OBJ  := $(patsubst %.c,$(ODIR)/%.o,$(SRC)) $(ODIR)/bytecode.o $(LLHTTP_OBJ) $(WIN_OBJ)
 
 LUAJIT_DIR := deps/LuaJIT/src
 
@@ -97,7 +98,8 @@ $(BIN): $(OBJ)
 	@echo LINK $(BIN)
 	@$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
 
-$(OBJ): config.h Makefile $(LUAJIT_DEP) | $(ODIR)
+# Every object depends on every header: struct layouts are shared across files.
+$(OBJ): config.h Makefile $(LUAJIT_DEP) $(wildcard src/*.h) | $(ODIR)
 
 $(ODIR):
 	@mkdir -p $@
@@ -118,6 +120,14 @@ $(ODIR)/%.o : %.c
 
 # Vendored third-party code: build quietly.
 $(ODIR)/wepoll.o: deps/wepoll/wepoll.c | $(ODIR)
+	@echo CC $<
+	@$(CC) $(CFLAGS) -w -c -o $@ $<
+
+$(ODIR)/llhttp_%.o: deps/llhttp/%.c deps/llhttp/llhttp.h | $(ODIR)
+	@echo CC $<
+	@$(CC) $(CFLAGS) -w -c -o $@ $<
+
+$(ODIR)/llhttp.o: deps/llhttp/llhttp.c deps/llhttp/llhttp.h | $(ODIR)
 	@echo CC $<
 	@$(CC) $(CFLAGS) -w -c -o $@ $<
 

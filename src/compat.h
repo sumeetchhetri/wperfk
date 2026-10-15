@@ -16,6 +16,7 @@
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <afunix.h>   // AF_UNIX: Windows 10 1803+
 
 int     wpk_net_init(void);
 int     wpk_socket(int family, int type, int protocol);
@@ -38,6 +39,7 @@ SOCKET  wpk_native(int fd);
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 
